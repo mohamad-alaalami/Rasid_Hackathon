@@ -70,7 +70,12 @@ def _register(store, args) -> list[dict]:
         if existing is not None:
             outcomes.append({"experiment": directory.name, "status": "already_versioned", "name": existing["name"]})
             continue
-        record = register_experiment(store, result, directory, source="backfill")
+        try:
+            record = register_experiment(store, result, directory, source="backfill")
+        except Exception as exc:
+            outcomes.append({"experiment": directory.name, "status": "error",
+                             "message": f"{type(exc).__name__}: {exc}"})
+            continue
         outcomes.append({"experiment": directory.name, "status": "registered", "name": record["name"]})
     return outcomes
 

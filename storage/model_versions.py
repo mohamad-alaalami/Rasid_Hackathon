@@ -158,13 +158,19 @@ def register_experiment(store, result: dict, experiment_dir: str | Path, *, sour
     missing = [name for name in ARTIFACT_FILES if not (experiment_dir / name).is_file()]
     if missing:
         raise FileNotFoundError(f"{experiment_dir} is missing {missing}.")
+    fields = {field: result.get(field) for field in RECORD_FIELDS}
+    if fields["best_val_score"] is None and "best_val_accuracy" in result:
+        # Runs from the original m-eurosat-only trainer used this field name.
+        fields.update(best_val_score=result["best_val_accuracy"], primary_metric="accuracy")
+    if not isinstance(fields["best_val_score"], (int, float)):
+        raise ValueError(f"{experiment_dir.name} has no validation score.")
     dataset_id = result["dataset_id"]
     record = {
         "dataset_id": dataset_id,
         "status": "uploading",
         "created_at": _now(),
         "source": source,
-        **{field: result.get(field) for field in RECORD_FIELDS},
+        **fields,
         "config": json.loads((experiment_dir / "config.json").read_text(encoding="utf-8")),
         "code": _code_version(),
     }
@@ -214,7 +220,12 @@ def promote_version(store, dataset_id: str, version: int | str, reason: str, pro
     record = get_version(store, dataset_id, version)
     if record.get("status") != "ready":
         raise ValueError(f"{record['name']} is {record.get('status')!r}, not ready.")
-    ready =[item for item in list_versions(store, dataset_id) if item.get("status") == "ready"]
+    if not record.get("preprocessing"):
+        raise ValueError(
+            f"{record['name']} was trained by an older GoTrain that did not save its "
+            "preprocessing, so it cannot be test-evaluated reliably. Promote a newer version."
+        )
+    ready = [item for item in list_versions(store, dataset_id) if item.get("status") == "ready"]
     best = max(ready, key=lambda item: item["best_val_score"])
     previous = get_champion(store, dataset_id)
     event = {

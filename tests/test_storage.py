@@ -37,6 +37,7 @@ def make_experiment(root, experiment_id, score, dataset_id="m-eurosat"):
         "task_type": "classification",
         "primary_metric": "accuracy",
         "best_val_score": score,
+        "preprocessing": {"band_indices": [3, 2, 1], "normalization": "imagenet_rgb"},
     }
     (directory / "result.json").write_text(json.dumps(result))
     return result, directory
@@ -160,6 +161,40 @@ class ModelVersionTests(unittest.TestCase):
         (self.store.root / "models/m-eurosat/v0001/best.pt").write_bytes(b"tampered")
         with self.assertRaisesRegex(ValueError, "Checksum mismatch"):
             download_version(self.store, "m-eurosat", 1)
+
+    def test_legacy_runs_are_versioned_but_cannot_be_champion(self):
+        result, directory = make_experiment(self.experiments, "exp_old", 0.9)
+        legacy = {k: v for k, v in result.items()
+                  if k not in {"best_val_score", "primary_metric", "preprocessing"}}
+        legacy["best_val_accuracy"] = 0.9
+        record = register_experiment(self.store, legacy, directory)
+        self.assertEqual((record["best_val_score"], record["primary_metric"]), (0.9, "accuracy"))
+        with self.assertRaisesRegex(ValueError, "older GoTrain"):
+            promote_version(self.store, "m-eurosat", 1, "highest score")
+        self.register("exp_new", 0.85)
+        champion = promote_version(self.store, "m-eurosat", 2, "newest evaluable")
+        self.assertEqual(champion["best_validation_version"], 1)
+        with self.assertRaisesRegex(ValueError, "no validation score"):
+            register_experiment(self.store, {"status": "completed", "dataset_id": "m-eurosat"}, directory)
+
+    def test_backfill_continues_past_bad_runs(self):
+        from storage.__main__ import main
+
+        make_experiment(self.experiments, "exp_good", 0.8)
+        _, broken = make_experiment(self.experiments, "exp_broken", 0.7)
+        (broken / "best.pt").unlink()
+        def register_all():
+            output = io.StringIO()
+            with patch("sys.stdout", output):
+                main(["--store", str(self.store.root), "register", "--all",
+                      "--experiments-dir", str(self.experiments)])
+            return json.loads(output.getvalue())
+
+        first, second = register_all(), register_all()
+        self.assertEqual({row["experiment"]: row["status"] for row in first},
+                         {"exp_broken": "error", "exp_good": "registered"})
+        self.assertEqual({row["experiment"]: row["status"] for row in second},
+                         {"exp_broken": "error", "exp_good": "already_versioned"})
 
     def test_promotion_history_is_kept(self):
         self.register("exp_a", 0.80)
