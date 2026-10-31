@@ -32,6 +32,10 @@ def build_report_experiment(version, record):
         "validation_score": record.get("validation_score"),
         "runtime_seconds": record.get("runtime_seconds"),
         "training_seconds": record.get("training_seconds"),
+        "requested_epochs": record.get("requested_epochs"),
+        "completed_epochs": record.get("completed_epochs"),
+        "stopped_early": record.get("stopped_early"),
+        "stop_reason": record.get("stop_reason"),
         "checkpoint_path": record.get("checkpoint_path"),
         "error": record.get("error"),
     }
@@ -158,6 +162,10 @@ def build_feedback(
             "validation_score"
         ),
         "status": experiment.get("status"),
+        "requested_epochs": experiment.get("requested_epochs"),
+        "completed_epochs": experiment.get("completed_epochs"),
+        "stopped_early": experiment.get("stopped_early"),
+        "stop_reason": experiment.get("stop_reason"),
         "remaining_budget": remaining_budget,
     }
 

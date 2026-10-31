@@ -36,6 +36,9 @@ IMPORTANT RULES:
 - Autonomous campaigns never access the test split; final test evaluation is a
   separate human-authorized workflow that is not exposed to campaign tools.
 - Respect experiment limits and GPU resources.
+- For longer runs, consider validation-based early stopping. Treat epochs as the
+  maximum, use a documented patience/min_delta, and reason from the factual
+  requested_epochs, completed_epochs, stopped_early, and stop_reason fields.
 - Do not repeat unsuccessful experiments without reason.
 - If a required tool is unavailable, report it clearly.
 - Base every decision on real tool outputs.

@@ -553,6 +553,13 @@ def _make_dataset_training_tool(
             "weight_decay": configuration.get("weight_decay", 0.0001),
             "pretrained": configuration.get("pretrained", True),
             "image_size": configuration.get("image_size"),
+            "early_stopping": configuration.get("early_stopping", False),
+            "early_stopping_patience": configuration.get(
+                "early_stopping_patience", 3
+            ),
+            "early_stopping_min_delta": configuration.get(
+                "early_stopping_min_delta", 0.0
+            ),
             "seed": seed,
             "device": "auto",
             "mixed_precision": True,
@@ -580,6 +587,12 @@ def _make_dataset_training_tool(
             "native_resolution": result["native_resolution"],
             "effective_resolution": result["effective_resolution"],
             "primary_metric": dataset_spec["primary_metric"],
+            "requested_epochs": result.get(
+                "requested_epochs", configuration["epochs"]
+            ),
+            "completed_epochs": result.get("completed_epochs", len(history)),
+            "stopped_early": result.get("stopped_early", False),
+            "stop_reason": result.get("stop_reason"),
         }
 
     return make_training_tool(
@@ -615,6 +628,11 @@ def execute_registered_training(dataset_id, configuration, seed, training_fn=run
         "weight_decay": configuration.get("weight_decay", 0.0001),
         "pretrained": configuration.get("pretrained", True),
         "image_size": configuration.get("image_size"),
+        "early_stopping": configuration.get("early_stopping", False),
+        "early_stopping_patience": configuration.get("early_stopping_patience", 3),
+        "early_stopping_min_delta": configuration.get(
+            "early_stopping_min_delta", 0.0
+        ),
         "seed": seed,
         "device": "auto",
         "mixed_precision": True,
@@ -654,6 +672,12 @@ def execute_registered_training(dataset_id, configuration, seed, training_fn=run
         "training_seconds": result["training_seconds"],
         "peak_gpu_memory_mb": result.get("peak_gpu_memory_mb"),
         "device": result["device"],
+        "requested_epochs": result.get(
+            "requested_epochs", configuration["epochs"]
+        ),
+        "completed_epochs": result.get("completed_epochs", len(history)),
+        "stopped_early": result.get("stopped_early", False),
+        "stop_reason": result.get("stop_reason"),
     }
 
 
@@ -688,6 +712,9 @@ def make_registered_training_tool(
         weight_decay: float = 0.0001,
         pretrained: bool = True,
         image_size: int | None = None,
+        early_stopping: bool = False,
+        early_stopping_patience: int = 3,
+        early_stopping_min_delta: float = 0.0,
     ) -> dict:
         """Run one real train/validation experiment within the campaign budget."""
         if required_dataset is not None and dataset_id != required_dataset:
@@ -707,6 +734,9 @@ def make_registered_training_tool(
             "weight_decay": weight_decay,
             "pretrained": pretrained,
             "image_size": image_size,
+            "early_stopping": early_stopping,
+            "early_stopping_patience": early_stopping_patience,
+            "early_stopping_min_delta": early_stopping_min_delta,
         }
         try:
             if not 1 <= epochs <= 20:
@@ -717,6 +747,10 @@ def make_registered_training_tool(
                 raise ValueError("learning_rate must be positive and weight_decay nonnegative.")
             if image_size is not None and image_size < 32:
                 raise ValueError("image_size must be at least 32 when explicitly set.")
+            if early_stopping_patience < 1:
+                raise ValueError("early_stopping_patience must be at least 1.")
+            if early_stopping_min_delta < 0:
+                raise ValueError("early_stopping_min_delta cannot be negative.")
             selected_model = validate_model_for_dataset(model_id, dataset_id)
             model_spec = get_model_spec(selected_model)
             runtime = model_runtime_status(selected_model)

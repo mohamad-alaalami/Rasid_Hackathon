@@ -54,6 +54,13 @@ def _error_type(exc: Exception) -> str:
     return "TRAINING_ERROR"
 
 
+def _update_early_stopping(score, reference_score, epochs_without_improvement, min_delta):
+    """Update patience using a meaningful validation-score improvement."""
+    if reference_score is None or score > reference_score + min_delta:
+        return score, 0
+    return reference_score, epochs_without_improvement + 1
+
+
 def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     """Train one registered classification or segmentation experiment."""
     experiment_id = datetime.now(timezone.utc).strftime("exp_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
@@ -130,6 +137,10 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         history: list[dict[str, Any]] = []
         best_accuracy = -1.0
         best_epoch = 0
+        early_stopping_reference = None
+        epochs_without_improvement = 0
+        stopped_early = False
+        stop_reason = None
         for epoch in range(1, cfg.epochs + 1):
             model.train()
             loss_total = 0.0
@@ -195,6 +206,25 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
                     },
                     checkpoint_path,
                 )
+            early_stopping_reference, epochs_without_improvement = (
+                _update_early_stopping(
+                    score,
+                    early_stopping_reference,
+                    epochs_without_improvement,
+                    cfg.early_stopping_min_delta,
+                )
+            )
+            if (
+                cfg.early_stopping
+                and epochs_without_improvement >= cfg.early_stopping_patience
+            ):
+                stopped_early = True
+                stop_reason = (
+                    f"{data.primary_metric} did not improve by more than "
+                    f"{cfg.early_stopping_min_delta} for "
+                    f"{cfg.early_stopping_patience} consecutive epochs"
+                )
+                break
 
         result = {
             "status": "completed",
@@ -206,6 +236,10 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             "native_resolution": list(data.native_resolution),
             "effective_resolution": list(data.effective_resolution),
             "best_epoch": best_epoch,
+            "requested_epochs": cfg.epochs,
+            "completed_epochs": len(history),
+            "stopped_early": stopped_early,
+            "stop_reason": stop_reason,
             "primary_metric": data.primary_metric,
             "best_val_score": best_accuracy,
             "training_seconds": round(time.perf_counter() - started, 3),

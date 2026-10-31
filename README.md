@@ -81,6 +81,26 @@ interpolation and segmentation masks use nearest-neighbor interpolation.
 
 Training uses only `train` and `valid`. The test split is reserved for one final evaluation.
 
+## Validation-based early stopping
+
+Early stopping is optional and disabled by default so existing baselines remain
+unchanged. Enable it in any training configuration or agent tool call:
+
+```json
+{
+  "epochs": 15,
+  "early_stopping": true,
+  "early_stopping_patience": 3,
+  "early_stopping_min_delta": 0.001
+}
+```
+
+`epochs` is then the maximum. Training stops after the primary validation metric
+(accuracy for classification or IoU for segmentation) fails to improve by more
+than `early_stopping_min_delta` for `early_stopping_patience` consecutive epochs.
+The best real checkpoint is preserved. Results record requested/completed epochs,
+whether stopping occurred, and the factual stop reason.
+
 ## Model selection
 
 `ml/model_registry.py` is the factual source for model compatibility and provenance.
