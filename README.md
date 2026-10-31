@@ -22,4 +22,12 @@ python -m ml.run_experiment --dataset-id m-eurosat --config configs/baseline.jso
 python -m agent.main
 ```
 
+Run the Phase-A one-batch GPU checks before adding model architectures:
+
+```bash
+python -m ml.smoke_test --dataset-id m-pv4ger
+python -m ml.smoke_test --dataset-id m-pv4ger-seg
+python -m ml.smoke_test --dataset-id m-chesapeake
+```
+
 Training uses only `train` and `valid`. The test split is reserved for one final evaluation.
