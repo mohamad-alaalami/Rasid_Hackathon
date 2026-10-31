@@ -55,12 +55,20 @@ def _error_type(exc: Exception) -> str:
 
 
 def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
-    """Train one controlled classification experiment and return JSON-safe metadata."""
-    cfg = TrainingConfig.from_mapping(config)
-    if dataset_id != "m-eurosat":
-        raise ValueError("Initial engine supports only dataset_id='m-eurosat'.")
-
+    """Train one registered classification or segmentation experiment."""
     experiment_id = datetime.now(timezone.utc).strftime("exp_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+    try:
+        cfg = TrainingConfig.from_mapping(config)
+        selected_model = cfg.validate_for_dataset(dataset_id)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "experiment_id": experiment_id,
+            "dataset_id": dataset_id,
+            "error_type": _error_type(exc),
+            "message": str(exc),
+        }
+
     experiment_dir = Path(cfg.output_dir).expanduser().resolve() / experiment_id
     experiment_dir.mkdir(parents=True, exist_ok=False)
     config_path = experiment_dir / "config.json"
@@ -69,19 +77,49 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     log_path = experiment_dir / "error.log"
     _json_write(config_path, {"dataset_id": dataset_id, **cfg.to_dict()})
     started = time.perf_counter()
+    data = None
 
     try:
         import torch
 
         from .dataset import create_dataloaders
-        from .evaluate import evaluate_classifier
-        from .models import create_model
+        from .evaluate import evaluate_model
+        from .model_registry import get_model_spec, model_runtime_status
+        from .models import create_model, model_logits, validate_model_output_shape
 
         _seed_everything(cfg.seed)
         device = _select_device(cfg.device)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         data = create_dataloaders(dataset_id, cfg)
-        model = create_model(cfg.model, data.num_classes, cfg.pretrained).to(device)
-        criterion = torch.nn.CrossEntropyLoss()
+        _json_write(
+            config_path,
+            {
+                "dataset_id": dataset_id,
+                **cfg.to_dict(),
+                "native_resolution": list(data.native_resolution),
+                "effective_resolution": list(data.effective_resolution),
+            },
+        )
+        model_spec = get_model_spec(selected_model)
+        model_environment = model_runtime_status(selected_model, cfg.checkpoint_dir)
+        pretrained_checkpoint = cfg.pretrained_checkpoint
+        if pretrained_checkpoint is None and model_spec.checkpoint_filename:
+            pretrained_checkpoint = str(
+                Path(cfg.checkpoint_dir).expanduser() / model_spec.checkpoint_filename
+            )
+        model = create_model(
+            selected_model,
+            data.task_type,
+            data.num_classes,
+            data.input_channels,
+            cfg.pretrained,
+            pretrained_checkpoint,
+        ).to(device)
+        criterion_kwargs = {}
+        if data.ignore_index is not None:
+            criterion_kwargs["ignore_index"] = data.ignore_index
+        criterion = torch.nn.CrossEntropyLoss(**criterion_kwargs)
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
         )
@@ -101,40 +139,59 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
                 labels = labels.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
-                    logits = model(images)
+                    logits = model_logits(model(images), data.task_type)
+                    validate_model_output_shape(logits, labels, data.task_type)
                     loss = criterion(logits, labels)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                batch_size = labels.size(0)
-                loss_total += float(loss.item()) * batch_size
-                seen += batch_size
+                item_count = labels.size(0)
+                loss_total += float(loss.item()) * item_count
+                seen += item_count
             scheduler.step()
-            validation = evaluate_classifier(model, data.val_loader, criterion, device)
+            validation = evaluate_model(
+                model,
+                data.val_loader,
+                criterion,
+                device,
+                data.task_type,
+                data.num_classes,
+                data.ignore_index,
+            )
+            score = validation[data.primary_metric]
             epoch_metrics = {
                 "epoch": epoch,
                 "train_loss": loss_total / seen,
-                "val_loss": validation["loss"],
-                "val_accuracy": validation["accuracy"],
                 "learning_rate": optimizer.param_groups[0]["lr"],
+                "native_resolution": list(data.native_resolution),
+                "effective_resolution": list(data.effective_resolution),
+                **{f"val_{key}": value for key, value in validation.items()},
             }
             history.append(epoch_metrics)
             _json_write(metrics_path, history)
-            if validation["accuracy"] > best_accuracy:
-                best_accuracy = validation["accuracy"]
+            if score > best_accuracy:
+                best_accuracy = score
                 best_epoch = epoch
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
-                        "model_name": cfg.model,
+                        "model_name": selected_model,
                         "dataset_id": dataset_id,
+                        "task_type": data.task_type,
                         "num_classes": data.num_classes,
                         "class_names": data.class_names,
                         "preprocessing": data.preprocessing,
+                        "pretraining": {
+                            "source": model_spec.pretraining_source,
+                            "checkpoint_id": model_spec.checkpoint_id,
+                            "license": model_spec.license,
+                            "installed_package_version": model_environment["installed_version"],
+                        },
                         "config": cfg.to_dict(),
                         "seed": cfg.seed,
                         "best_epoch": best_epoch,
-                        "best_val_accuracy": best_accuracy,
+                        "primary_metric": data.primary_metric,
+                        "best_val_score": best_accuracy,
                     },
                     checkpoint_path,
                 )
@@ -143,30 +200,55 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             "status": "completed",
             "experiment_id": experiment_id,
             "dataset_id": dataset_id,
-            "model": cfg.model,
+            "model": selected_model,
+            "task_type": data.task_type,
             "input_mode": cfg.input_mode,
+            "native_resolution": list(data.native_resolution),
+            "effective_resolution": list(data.effective_resolution),
             "best_epoch": best_epoch,
-            "best_val_accuracy": best_accuracy,
+            "primary_metric": data.primary_metric,
+            "best_val_score": best_accuracy,
             "training_seconds": round(time.perf_counter() - started, 3),
             "device": str(device),
             "checkpoint_path": str(checkpoint_path),
             "metrics_path": str(metrics_path),
             "config_path": str(config_path),
+            "pretraining_source": model_spec.pretraining_source,
+            "pretrained_checkpoint_id": model_spec.checkpoint_id,
+            "preprocessing": data.preprocessing,
+            "model_environment": model_environment,
         }
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            result["peak_gpu_memory_mb"] = round(
+                torch.cuda.max_memory_allocated(device) / (1024**2), 2
+            )
+        else:
+            result["peak_gpu_memory_mb"] = None
+        result[f"best_val_{data.primary_metric}"] = best_accuracy
         _json_write(experiment_dir / "result.json", result)
         return result
     except Exception as exc:
         log_path.write_text(traceback.format_exc(), encoding="utf-8")
+        message = str(exc)
+        if _error_type(exc) == "CUDA_OUT_OF_MEMORY":
+            message += (
+                " The engine kept the requested resolution unchanged. Retry with a smaller "
+                "batch_size, or set image_size explicitly for a deliberate resize experiment."
+            )
         result = {
             "status": "failed",
             "experiment_id": experiment_id,
             "dataset_id": dataset_id,
             "error_type": _error_type(exc),
-            "message": str(exc),
+            "message": message,
             "training_seconds": round(time.perf_counter() - started, 3),
             "log_path": str(log_path),
             "config_path": str(config_path),
         }
+        if data is not None:
+            result["native_resolution"] = list(data.native_resolution)
+            result["effective_resolution"] = list(data.effective_resolution)
         _json_write(experiment_dir / "result.json", result)
         return result
 

@@ -1,7 +1,7 @@
 {
-  "model": "resnet18",
+  "model": "resnet18_rgb",
   "pretrained": true,
-  "input_mode": "rgb",
+  "input_mode": "registry",
   "epochs": 1,
   "batch_size": 32,
   "learning_rate": 0.0003,
@@ -12,6 +12,6 @@
   "device": "auto",
   "output_dir": "experiments",
   "benchmark_dir": null,
-  "image_size": 64
+  "image_size": null
 }
 
