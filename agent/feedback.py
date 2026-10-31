@@ -90,6 +90,7 @@ def build_feedback(
     # E0: Minimal feedback
     feedback = {
         "configuration": experiment.get("configuration"),
+        "primary_metric": experiment.get("primary_metric"),
         "validation_score": experiment.get(
             "validation_score"
         ),
@@ -133,13 +134,10 @@ def build_feedback(
     # E3: Allow requesting additional diagnostics
     if version == "E3":
 
-        feedback["detailed_diagnostics_available"] = True
+        diagnostics = experiment.get("detailed_diagnostics") or {}
+        feedback["detailed_diagnostics_available"] = sorted(diagnostics)
 
         if request_details:
-            diagnostics = experiment.get(
-                "detailed_diagnostics", {}
-            )
-
             allowed_fields = [
                 "per_class_metrics",
                 "confusion_matrix",

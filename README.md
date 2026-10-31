@@ -14,13 +14,28 @@ To add another compatible GEO-Bench classification or semantic-segmentation data
 add its verified contract to `ml/registry.py`. The loader, model factory, trainer,
 evaluator, command line, and agent tools then select their behavior dynamically.
 
-Run a smoke test:
+Run a real autonomous E3 campaign on SageMaker:
+
+```bash
+python -m agent.main --mode campaign --feedback E3 --max-experiments 5
+```
+
+Claude inspects the GPU and registry, selects one dataset, discovers eligible
+models, and launches only real `ml.train_model()` experiments. Campaign records
+are persisted under `artifacts/campaigns/`. Supply `--campaign-id ID` to resume,
+or `--dataset m-pv4ger` to restrict dataset selection.
+
+Run an explicitly bounded one-run debugging smoke test:
 
 ```bash
 python -m ml.inspect_dataset --dataset-id m-eurosat
 python -m ml.run_experiment --dataset-id m-eurosat --config configs/baseline.json
-python -m agent.main
+python -m agent.main --mode smoke --dataset m-eurosat --model resnet18_rgb
 ```
+
+There is no simulated feedback probe. E0-E3 observations are constructed only
+from persisted real train/validation experiment artifacts. Missing diagnostics
+are reported as unavailable and failures are saved as failures.
 
 Run the Phase-A one-batch GPU checks before adding model architectures:
 

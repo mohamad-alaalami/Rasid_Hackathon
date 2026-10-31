@@ -33,7 +33,8 @@ IMPORTANT RULES:
 - Use training data for training.
 - Use validation data for model improvement.
 - Never use test data during optimization.
-- Test only the final selected model, once.
+- Autonomous campaigns never access the test split; final test evaluation is a
+  separate human-authorized workflow that is not exposed to campaign tools.
 - Respect experiment limits and GPU resources.
 - Do not repeat unsuccessful experiments without reason.
 - If a required tool is unavailable, report it clearly.

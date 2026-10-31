@@ -23,7 +23,7 @@ from pathlib import Path
 
 
 FEEDBACK_VERSIONS = ("E0", "E1", "E2", "E3")
-RESULTS_DIR = Path("artifacts/feedback_tests")
+RESULTS_DIR = Path("artifacts/campaigns")
 _PROCESS_LOCK = threading.RLock()
 
 try:
@@ -346,6 +346,15 @@ def load_experiments(
     return records
 
 
+def load_campaign_experiments(version, campaign_id, seed=None):
+    """Load all real experiment records belonging to one campaign."""
+    return load_experiments(
+        version,
+        campaign_id=campaign_id,
+        seed=seed,
+    )
+
+
 def _budget_usage(runs):
     """Count all launches and reserved/used GPU seconds."""
 
@@ -374,8 +383,10 @@ def get_budget_status(
     _check_identity(campaign_id, dataset, seed)
 
     with _locked_storage():
-        runs = _scope(version, campaign_id, dataset, seed)
-
+        runs = [
+            run for run in _latest_records(version)
+            if run.get("campaign_id") == campaign_id and run.get("seed") == seed
+        ]
     if runs and "_max_experiments" in runs[0]:
         max_experiments = runs[0]["_max_experiments"]
         max_gpu_seconds = runs[0].get("_max_gpu_seconds")
@@ -438,6 +449,20 @@ def reserve_training(
 
     with _locked_storage():
         runs = _scope(version, campaign_id, dataset, seed)
+        campaign_runs = [
+            run for run in _latest_records(version)
+            if run.get("campaign_id") == campaign_id and run.get("seed") == seed
+        ]
+        selected_datasets = {run.get("dataset") for run in campaign_runs}
+        if selected_datasets and dataset not in selected_datasets:
+            return {
+                "status": "rejected",
+                "error_code": "CAMPAIGN_DATASET_LOCKED",
+                "message": (
+                    "A campaign may optimize only one dataset; it is already locked "
+                    f"to {sorted(selected_datasets)}."
+                ),
+            }
 
         # Do not allow the configured limits to change
         # after a campaign trial has started.
@@ -463,7 +488,7 @@ def reserve_training(
                     "existing_experiment_id": run["experiment_id"],
                 }
 
-        launched, gpu_used = _budget_usage(runs)
+        launched, gpu_used = _budget_usage(campaign_runs)
 
         if launched >= max_experiments:
             return {
