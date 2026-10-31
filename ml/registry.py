@@ -14,7 +14,6 @@ class DatasetSpec:
     available_channels: int
     band_indices: tuple[int, ...]
     scale_divisor: float
-    default_model: str
     primary_metric: str
     ignore_index: int | None = None
 
@@ -36,7 +35,6 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         # contains 13 bands, but this experiment profile selects B04/B03/B02.
         band_indices=(3, 2, 1),
         scale_divisor=10000.0,
-        default_model="resnet18",
         primary_metric="accuracy",
     ),
     "m-pv4ger": DatasetSpec(
@@ -47,7 +45,6 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         available_channels=3,
         band_indices=(0, 1, 2),  # native aerial RGB order
         scale_divisor=255.0,
-        default_model="resnet18",
         primary_metric="accuracy",
     ),
     "m-pv4ger-seg": DatasetSpec(
@@ -58,7 +55,6 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         available_channels=3,
         band_indices=(0, 1, 2),
         scale_divisor=255.0,
-        default_model="fcn_resnet50",
         primary_metric="mean_iou",
     ),
     "m-chesapeake": DatasetSpec(
@@ -69,7 +65,6 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         available_channels=4,
         band_indices=(0, 1, 2, 3),  # native aerial RGB+NIR order
         scale_divisor=255.0,
-        default_model="fcn_resnet50",
         primary_metric="mean_iou",
     ),
 }
@@ -94,7 +89,6 @@ def list_dataset_specs() -> list[dict]:
             "num_classes": spec.num_classes,
             "available_channels": spec.available_channels,
             "input_channels": spec.input_channels,
-            "default_model": spec.default_model,
             "primary_metric": spec.primary_metric,
         }
         for spec in DATASET_REGISTRY.values()

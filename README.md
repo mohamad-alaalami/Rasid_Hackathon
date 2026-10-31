@@ -25,9 +25,38 @@ python -m agent.main
 Run the Phase-A one-batch GPU checks before adding model architectures:
 
 ```bash
-python -m ml.smoke_test --dataset-id m-pv4ger
-python -m ml.smoke_test --dataset-id m-pv4ger-seg
-python -m ml.smoke_test --dataset-id m-chesapeake
+python -m ml.smoke_test --dataset-id m-pv4ger --model resnet18_rgb
+python -m ml.smoke_test --dataset-id m-pv4ger-seg --model fcn_resnet50
+python -m ml.smoke_test --dataset-id m-chesapeake --model fcn_resnet50
 ```
 
 Training uses only `train` and `valid`. The test split is reserved for one final evaluation.
+
+## Model selection
+
+`ml/model_registry.py` is the factual source for model compatibility and provenance.
+Claude must call `list_eligible_models(dataset_id)` and may select only entries whose
+runtime `eligible` value is true. Missing packages or exact checkpoints are reported;
+the engine never substitutes random weights.
+
+Target configurations:
+
+- `resnet18_rgb`: TorchVision `ResNet18_Weights.IMAGENET1K_V1`
+- `convnext_tiny_rgb`: TorchVision `ConvNeXt_Tiny_Weights.IMAGENET1K_V1`
+- `resnet18_s2`: SSL4EO-S12 `B13_rn18_moco_0099_ckpt.pth`
+- `resnet50_s2`: SSL4EO-S12 `B13_rn50_dino_0099.pth`
+- `unet_r34`: SMP U-Net with pinned ResNet-34 ImageNet encoder provenance
+- `deeplabv3plus_r50`: SMP DeepLabV3+ with pinned ResNet-50 ImageNet encoder provenance
+
+The existing `fcn_resnet50` implementation is retained as a legacy segmentation
+baseline but is not presented as one of the requested target configurations.
+
+Run every currently eligible combination on SageMaker:
+
+```bash
+python -m ml.smoke_matrix --include-legacy
+```
+
+The command saves factual runtime and peak-memory results to
+`artifacts/smoke_matrix.json`. Models with missing dependencies or checkpoints are
+recorded as skipped, not silently initialized.

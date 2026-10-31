@@ -1,0 +1,2 @@
+# Optional target-model dependency. Verify on SageMaker before installation.
+segmentation-models-pytorch>=0.5.0,<0.6

@@ -1,5 +1,5 @@
 {
-  "model": "resnet18",
+  "model": "resnet18_rgb",
   "pretrained": true,
   "input_mode": "registry",
   "epochs": 1,

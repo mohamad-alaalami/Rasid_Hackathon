@@ -56,10 +56,19 @@ def _error_type(exc: Exception) -> str:
 
 def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     """Train one registered classification or segmentation experiment."""
-    cfg = TrainingConfig.from_mapping(config)
-    selected_model = cfg.validate_for_dataset(dataset_id)
-
     experiment_id = datetime.now(timezone.utc).strftime("exp_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+    try:
+        cfg = TrainingConfig.from_mapping(config)
+        selected_model = cfg.validate_for_dataset(dataset_id)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "experiment_id": experiment_id,
+            "dataset_id": dataset_id,
+            "error_type": _error_type(exc),
+            "message": str(exc),
+        }
+
     experiment_dir = Path(cfg.output_dir).expanduser().resolve() / experiment_id
     experiment_dir.mkdir(parents=True, exist_ok=False)
     config_path = experiment_dir / "config.json"
@@ -74,17 +83,28 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
 
         from .dataset import create_dataloaders
         from .evaluate import evaluate_model
+        from .model_registry import get_model_spec, model_runtime_status
         from .models import create_model, model_logits
 
         _seed_everything(cfg.seed)
         device = _select_device(cfg.device)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         data = create_dataloaders(dataset_id, cfg)
+        model_spec = get_model_spec(selected_model)
+        model_environment = model_runtime_status(selected_model, cfg.checkpoint_dir)
+        pretrained_checkpoint = cfg.pretrained_checkpoint
+        if pretrained_checkpoint is None and model_spec.checkpoint_filename:
+            pretrained_checkpoint = str(
+                Path(cfg.checkpoint_dir).expanduser() / model_spec.checkpoint_filename
+            )
         model = create_model(
             selected_model,
             data.task_type,
             data.num_classes,
             data.input_channels,
             cfg.pretrained,
+            pretrained_checkpoint,
         ).to(device)
         criterion_kwargs = {}
         if data.ignore_index is not None:
@@ -148,6 +168,12 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
                         "num_classes": data.num_classes,
                         "class_names": data.class_names,
                         "preprocessing": data.preprocessing,
+                        "pretraining": {
+                            "source": model_spec.pretraining_source,
+                            "checkpoint_id": model_spec.checkpoint_id,
+                            "license": model_spec.license,
+                            "installed_package_version": model_environment["installed_version"],
+                        },
                         "config": cfg.to_dict(),
                         "seed": cfg.seed,
                         "best_epoch": best_epoch,
@@ -172,7 +198,18 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             "checkpoint_path": str(checkpoint_path),
             "metrics_path": str(metrics_path),
             "config_path": str(config_path),
+            "pretraining_source": model_spec.pretraining_source,
+            "pretrained_checkpoint_id": model_spec.checkpoint_id,
+            "preprocessing": data.preprocessing,
+            "model_environment": model_environment,
         }
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            result["peak_gpu_memory_mb"] = round(
+                torch.cuda.max_memory_allocated(device) / (1024**2), 2
+            )
+        else:
+            result["peak_gpu_memory_mb"] = None
         result[f"best_val_{data.primary_metric}"] = best_accuracy
         _json_write(experiment_dir / "result.json", result)
         return result

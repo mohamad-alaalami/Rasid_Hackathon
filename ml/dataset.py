@@ -72,9 +72,19 @@ def _extract_label(sample: Any) -> int:
 class GeoBenchDataset:
     """PyTorch view shared by registered classification and segmentation tasks."""
 
-    def __init__(self, dataset: Any, spec: DatasetSpec, image_size: int, augment: bool):
+    def __init__(
+        self,
+        dataset: Any,
+        spec: DatasetSpec,
+        band_indices: tuple[int, ...],
+        normalization: str,
+        image_size: int,
+        augment: bool,
+    ):
         self.dataset = dataset
         self.spec = spec
+        self.band_indices = band_indices
+        self.normalization = normalization
         self.image_size = image_size
         self.augment = augment
 
@@ -85,12 +95,12 @@ class GeoBenchDataset:
         np, torch = _require_ml_dependencies()
         sample = self.dataset[index]
         bands = getattr(sample, "bands", None)
-        if bands is None or max(self.spec.band_indices) >= len(bands):
+        if bands is None or max(self.band_indices) >= len(bands):
             raise TypeError(
-                f"{self.spec.dataset_id} requires band indices {self.spec.band_indices}; "
+                f"{self.spec.dataset_id} requires band indices {self.band_indices}; "
                 f"sample has {0 if bands is None else len(bands)} bands."
             )
-        arrays = [np.asarray(_band_array(bands[i])).squeeze() for i in self.spec.band_indices]
+        arrays = [np.asarray(_band_array(bands[i])).squeeze() for i in self.band_indices]
         image_np = np.stack(arrays, axis=0).astype(np.float32)
         if image_np.ndim != 3 or not np.isfinite(image_np).all():
             raise ValueError(f"Invalid image tensor shape or values: {image_np.shape}.")
@@ -110,13 +120,15 @@ class GeoBenchDataset:
                 raise ValueError("Segmentation mask contains a class outside the registry contract.")
 
         image, target = self._resize_and_augment(image, target)
-        if self.spec.input_channels == 3:
+        if self.normalization == "imagenet_rgb":
             mean_values, std_values = IMAGENET_MEAN, IMAGENET_STD
+        elif self.normalization == "imagenet_rgb_plus_nir":
+            mean_values = IMAGENET_MEAN + (0.5,)
+            std_values = IMAGENET_STD + (0.25,)
+        elif self.normalization == "none":
+            return image, target
         else:
-            # A neutral, deterministic normalization for multispectral inputs.
-            # Dataset-specific statistics can later be stored in the registry.
-            mean_values = (0.5,) * self.spec.input_channels
-            std_values = (0.25,) * self.spec.input_channels
+            raise ValueError(f"Unknown normalization contract: {self.normalization}")
         mean = torch.tensor(mean_values, dtype=image.dtype)[:, None, None]
         std = torch.tensor(std_values, dtype=image.dtype)[:, None, None]
         return (image - mean) / std, target
@@ -160,14 +172,38 @@ class DataBundle:
 def create_dataloaders(dataset_id: str, config) -> DataBundle:
     _, torch = _require_ml_dependencies()
     spec = get_dataset_spec(dataset_id)
+    from .model_registry import get_model_spec
+
+    model_spec = get_model_spec(config.model)
+    if model_spec.input_profile == "sentinel2_13":
+        if dataset_id != "m-eurosat":
+            raise ValueError("sentinel2_13 input is currently verified only for m-eurosat.")
+        # Reorder GEO-Bench's known physical storage order to SSL4EO-S12's
+        # canonical S2 order: B01..B08, B8A, B09..B12.
+        band_indices = (0, 1, 2, 3, 4, 5, 6, 7, 12, 8, 9, 10, 11)
+        normalization = "none"
+    elif model_spec.input_profile == "rgb":
+        if len(spec.band_indices) < 3:
+            raise ValueError(f"{dataset_id} has no verified RGB profile.")
+        band_indices = spec.band_indices[:3]
+        normalization = "imagenet_rgb"
+    elif model_spec.input_profile == "dataset_channels":
+        band_indices = spec.band_indices
+        normalization = "imagenet_rgb" if len(band_indices) == 3 else "imagenet_rgb_plus_nir"
+    else:
+        raise ValueError(f"Unknown input profile {model_spec.input_profile!r}.")
     task = find_task(dataset_id, config.benchmark_dir)
     # Load all bands, then apply verified physical indices from the registry.
     # This is essential for datasets such as m-eurosat whose stored band names
     # are known to be wrong even though the pixel order is valid.
     train_source = task.get_dataset(split="train", band_names=None)
     val_source = task.get_dataset(split="valid", band_names=None)
-    train_dataset = GeoBenchDataset(train_source, spec, config.image_size, augment=True)
-    val_dataset = GeoBenchDataset(val_source, spec, config.image_size, augment=False)
+    train_dataset = GeoBenchDataset(
+        train_source, spec, band_indices, normalization, config.image_size, augment=True
+    )
+    val_dataset = GeoBenchDataset(
+        val_source, spec, band_indices, normalization, config.image_size, augment=False
+    )
     generator = torch.Generator().manual_seed(config.seed)
     loader_kwargs = dict(
         batch_size=config.batch_size,
@@ -192,14 +228,15 @@ def create_dataloaders(dataset_id: str, config) -> DataBundle:
         val_loader=val_loader,
         task_type=spec.task_type,
         num_classes=spec.num_classes,
-        input_channels=spec.input_channels,
+        input_channels=len(band_indices),
         class_names=class_names,
         ignore_index=spec.ignore_index,
         primary_metric=spec.primary_metric,
         preprocessing={
-            "band_indices": list(spec.band_indices),
+            "input_profile": model_spec.input_profile,
+            "band_indices": list(band_indices),
             "scale_divisor": spec.scale_divisor,
-            "normalization": "imagenet_rgb" if spec.input_channels == 3 else "0.5_mean_0.25_std",
+            "normalization": normalization,
             "image_size": config.image_size,
         },
     )

@@ -6,7 +6,7 @@ from ml.config import TrainingConfig
 class TrainingConfigTests(unittest.TestCase):
     def test_valid_minimal_configuration(self):
         config = TrainingConfig.from_mapping({"epochs": 1})
-        self.assertEqual(config.model, "auto")
+        self.assertEqual(config.model, "resnet18_rgb")
         self.assertEqual(config.epochs, 1)
 
     def test_unknown_keys_are_rejected(self):
@@ -14,7 +14,7 @@ class TrainingConfigTests(unittest.TestCase):
             TrainingConfig.from_mapping({"magic": True})
 
     def test_invalid_model_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "model must"):
+        with self.assertRaisesRegex(ValueError, "Unknown model"):
             TrainingConfig.from_mapping({"model": "unknown"})
 
     def test_model_dataset_compatibility(self):

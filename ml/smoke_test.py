@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 import time
 from typing import Any
 
@@ -13,8 +14,11 @@ from .config import TrainingConfig
 def run_smoke_test(
     dataset_id: str,
     *,
+    model_id: str,
     batch_size: int = 2,
     benchmark_dir: str | None = None,
+    checkpoint_dir: str = "checkpoints",
+    pretrained_checkpoint: str | None = None,
     pretrained: bool = True,
 ) -> dict[str, Any]:
     """Run one train batch and one validation batch without touching test data."""
@@ -23,10 +27,11 @@ def run_smoke_test(
     from .dataset import create_dataloaders
     from .evaluate import evaluate_model
     from .models import create_model, model_logits
+    from .model_registry import get_model_spec
 
     config = TrainingConfig.from_mapping(
         {
-            "model": "auto",
+            "model": model_id,
             "pretrained": pretrained,
             "input_mode": "registry",
             "epochs": 1,
@@ -35,9 +40,15 @@ def run_smoke_test(
             "mixed_precision": True,
             "device": "auto",
             "benchmark_dir": benchmark_dir,
+            "checkpoint_dir": checkpoint_dir,
+            "pretrained_checkpoint": pretrained_checkpoint,
         }
     )
     model_name = config.validate_for_dataset(dataset_id)
+    model_spec = get_model_spec(model_name)
+    checkpoint_path = config.pretrained_checkpoint
+    if checkpoint_path is None and model_spec.checkpoint_filename:
+        checkpoint_path = f"{config.checkpoint_dir}/{model_spec.checkpoint_filename}"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -50,6 +61,7 @@ def run_smoke_test(
         data.num_classes,
         data.input_channels,
         config.pretrained,
+        checkpoint_path,
     ).to(device)
     criterion_kwargs = {}
     if data.ignore_index is not None:
@@ -82,6 +94,18 @@ def run_smoke_test(
         torch.cuda.synchronize(device)
         peak_memory_mb = round(torch.cuda.max_memory_allocated(device) / (1024**2), 2)
 
+    with tempfile.TemporaryDirectory(prefix="gotrain-smoke-") as temporary:
+        checkpoint_path = f"{temporary}/model.pt"
+        torch.save(model.state_dict(), checkpoint_path)
+        reloaded = create_model(
+            model_name,
+            data.task_type,
+            data.num_classes,
+            data.input_channels,
+            pretrained=False,
+        ).to(device)
+        reloaded.load_state_dict(torch.load(checkpoint_path, map_location=device))
+
     result = {
         "status": "completed",
         "dataset_id": dataset_id,
@@ -98,6 +122,7 @@ def run_smoke_test(
         "primary_metric": data.primary_metric,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "peak_gpu_memory_mb": peak_memory_mb,
+        "checkpoint_reload_verified": True,
         "test_split_accessed": False,
     }
     return result
@@ -106,15 +131,21 @@ def run_smoke_test(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-id", required=True)
+    parser.add_argument("--model", required=True)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--benchmark-dir")
+    parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--pretrained-checkpoint")
     parser.add_argument("--no-pretrained", action="store_true")
     args = parser.parse_args()
     try:
         result = run_smoke_test(
             args.dataset_id,
+            model_id=args.model,
             batch_size=args.batch_size,
             benchmark_dir=args.benchmark_dir,
+            checkpoint_dir=args.checkpoint_dir,
+            pretrained_checkpoint=args.pretrained_checkpoint,
             pretrained=not args.no_pretrained,
         )
     except Exception as exc:

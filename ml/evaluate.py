@@ -51,6 +51,7 @@ def evaluate_model(model, loader, criterion, device, task_type, num_classes, ign
         "mean_iou": float(per_class[valid_classes].mean().item()),
         "pixel_accuracy": float(intersection.sum().item() / confusion.sum().item()),
         "per_class_iou": [None if torch.isnan(x) else float(x) for x in per_class],
+        "absent_class_policy": "exclude classes with zero union from mean_iou",
     }
 
 

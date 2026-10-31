@@ -5,7 +5,14 @@ import torch
 
 from ml import train_model as run_training
 from ml.inspect_dataset import inspect_dataset as inspect_ml_dataset
-from ml.registry import get_dataset_spec, list_dataset_specs
+from ml.model_registry import (
+    get_model_spec,
+    list_eligible_models as eligible_model_metadata,
+    list_model_options,
+    model_runtime_status,
+    validate_model_for_dataset,
+)
+from ml.registry import list_dataset_specs
 
 
 @tool
@@ -49,6 +56,16 @@ def list_supported_datasets() -> dict:
 
 
 @tool
+def list_eligible_models(dataset_id: str) -> dict:
+    """Return factual eligible and deferred model metadata for a registered dataset."""
+    return {
+        "dataset_id": dataset_id,
+        "eligible": eligible_model_metadata(dataset_id),
+        "all_options": list_model_options(dataset_id),
+    }
+
+
+@tool
 def inspect_dataset(dataset_id: str) -> dict:
     """Inspect one registered dataset's train/validation data without using test data."""
     return inspect_ml_dataset(dataset_id=dataset_id)
@@ -57,6 +74,7 @@ def inspect_dataset(dataset_id: str) -> dict:
 @tool
 def train_registered_model(
     dataset_id: str,
+    model_id: str,
     epochs: int = 1,
     batch_size: int = 32,
     learning_rate: float = 0.0003,
@@ -69,15 +87,29 @@ def train_registered_model(
     Inspect the dataset first. The registry selects the compatible task type, model,
     channels, class count, and metric. This tool never accesses the test split.
     """
-    spec = get_dataset_spec(dataset_id)
+    selected_model = validate_model_for_dataset(model_id, dataset_id)
+    model_spec = get_model_spec(selected_model)
+    runtime = model_runtime_status(selected_model)
+    if not runtime["eligible"]:
+        return {
+            "status": "rejected",
+            "error_type": "MODEL_NOT_ELIGIBLE",
+            "message": runtime["reason"],
+        }
     if not 1 <= epochs <= 20:
         return {"status": "rejected", "message": "epochs must be between 1 and 20."}
-    if not 1 <= batch_size <= 64:
-        return {"status": "rejected", "message": "batch_size must be between 1 and 64."}
+    if not 1 <= batch_size <= model_spec.conservative_batch_size:
+        return {
+            "status": "rejected",
+            "message": (
+                f"batch_size must be between 1 and "
+                f"{model_spec.conservative_batch_size} for {selected_model}."
+            ),
+        }
     return run_training(
         dataset_id=dataset_id,
         config={
-            "model": spec.default_model,
+            "model": selected_model,
             "pretrained": pretrained,
             "input_mode": "registry",
             "epochs": epochs,

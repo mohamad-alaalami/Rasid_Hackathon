@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    model: str = "auto"
+    model: str = "resnet18_rgb"
     pretrained: bool = True
     input_mode: str = "registry"
     epochs: int = 5
@@ -23,6 +23,8 @@ class TrainingConfig:
     device: str = "auto"
     output_dir: str = "experiments"
     benchmark_dir: str | None = None
+    checkpoint_dir: str = "checkpoints"
+    pretrained_checkpoint: str | None = None
     image_size: int = 64
 
     @classmethod
@@ -44,6 +46,8 @@ class TrainingConfig:
             "device": str,
             "output_dir": str,
             "benchmark_dir": (str, type(None)),
+            "checkpoint_dir": str,
+            "pretrained_checkpoint": (str, type(None)),
             "image_size": int,
         }
         for name, value in raw.items():
@@ -59,8 +63,9 @@ class TrainingConfig:
         return config
 
     def validate(self) -> None:
-        if self.model not in {"auto", "resnet18", "fcn_resnet50"}:
-            raise ValueError("model must be 'auto', 'resnet18', or 'fcn_resnet50'.")
+        from .model_registry import get_model_spec
+
+        get_model_spec(self.model)
         if self.input_mode != "registry":
             raise ValueError("input_mode must be 'registry'; dataset channels come from ml/registry.py.")
         if self.epochs < 1:
@@ -81,20 +86,9 @@ class TrainingConfig:
             raise ValueError(f"benchmark_dir does not exist: {self.benchmark_dir}")
 
     def validate_for_dataset(self, dataset_id: str) -> str:
-        from .registry import get_dataset_spec
+        from .model_registry import validate_model_for_dataset
 
-        spec = get_dataset_spec(dataset_id)
-        selected_model = spec.default_model if self.model == "auto" else self.model
-        allowed = {
-            "classification": {"resnet18"},
-            "segmentation": {"fcn_resnet50"},
-        }[spec.task_type]
-        if selected_model not in allowed:
-            raise ValueError(
-                f"model={selected_model!r} is incompatible with "
-                f"dataset={dataset_id!r} ({spec.task_type})."
-            )
-        return selected_model
+        return validate_model_for_dataset(self.model, dataset_id)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

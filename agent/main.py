@@ -7,6 +7,7 @@ from agent.tools import (
     agent_capabilities,
     inspect_dataset,
     inspect_gpu,
+    list_eligible_models,
     list_supported_datasets,
     train_registered_model,
 )
@@ -32,6 +33,7 @@ def create_agent():
             agent_capabilities,
             inspect_gpu,
             list_supported_datasets,
+            list_eligible_models,
             inspect_dataset,
             train_registered_model,
         ]
@@ -64,13 +66,15 @@ if __name__ == "__main__":
         2. Call inspect_gpu.
         3. Call list_supported_datasets.
         4. Call inspect_dataset with dataset_id "m-eurosat".
-        5. If those checks succeed, call train_registered_model once for
-           "m-eurosat" with epochs=1, batch_size=32,
+        5. Call list_eligible_models for "m-eurosat" and select only a model
+           whose eligible field is true. Explain the choice using factual metadata.
+        6. If those checks succeed, call train_registered_model once for
+           "m-eurosat" with the selected model_id, epochs=1, batch_size=32,
            learning_rate=0.0003, weight_decay=0.0001,
            pretrained=true, and seed=42.
-        6. Report the task type, primary validation metric, training time,
+        7. Report the task type, primary validation metric, training time,
            checkpoint path, and experiment ID.
-        7. Explain whether the run succeeded and recommend one next experiment.
+        8. Explain whether the run succeeded and recommend one next experiment.
 
         Use real tool outputs only.
         Never invent metrics and never access the test split.
