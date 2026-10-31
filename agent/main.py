@@ -42,9 +42,10 @@ def create_campaign_agent(args, campaign_id: str) -> Agent:
             max_experiments=args.max_experiments,
             required_dataset=args.dataset,
         ),
-        make_campaign_history_tool(args.feedback, campaign_id, args.seed),
         make_campaign_report_tool(args.feedback, campaign_id, args.seed),
     ]
+    if args.feedback in {"E2", "E3"}:
+        tools.append(make_campaign_history_tool(args.feedback, campaign_id, args.seed))
     if args.feedback == "E3":
         tools.append(make_campaign_diagnostics_tool(args.feedback, campaign_id, args.seed))
     return Agent(

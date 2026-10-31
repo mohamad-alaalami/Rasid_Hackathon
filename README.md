@@ -37,6 +37,34 @@ There is no simulated feedback probe. E0-E3 observations are constructed only
 from persisted real train/validation experiment artifacts. Missing diagnostics
 are reported as unavailable and failures are saved as failures.
 
+## Controlled E0-E3 comparison
+
+Run a small real SageMaker pilot (four isolated campaigns, three experiments each):
+
+```bash
+python -m agent.compare_feedback \
+  --dataset m-pv4ger \
+  --repeats 1 \
+  --max-experiments 3 \
+  --seed 42
+```
+
+Run a larger matched-seed comparison:
+
+```bash
+python -m agent.compare_feedback \
+  --dataset m-pv4ger \
+  --repeats 3 \
+  --max-experiments 3 \
+  --seed 42
+```
+
+Every mode receives the same forced first real configuration for a given seed.
+E0/E1 have no history tool, E2 has isolated campaign history, and E3 additionally
+has real recorded diagnostics. Outputs are written to a new timestamped directory
+under `artifacts/feedback_comparison/` as JSON, CSV, Markdown, and per-trial decision
+traces; previous campaign and comparison results are never overwritten.
+
 Run the Phase-A one-batch GPU checks before adding model architectures:
 
 ```bash

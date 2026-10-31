@@ -594,7 +594,7 @@ def _make_dataset_training_tool(
     )
 
 
-def _real_training_result(dataset_id, configuration, seed, training_fn=run_training):
+def execute_registered_training(dataset_id, configuration, seed, training_fn=run_training):
     """Run the real ML API and translate only its factual artifacts."""
     selected_model = validate_model_for_dataset(configuration["architecture"], dataset_id)
     model_spec = get_model_spec(selected_model)
@@ -665,6 +665,7 @@ def make_registered_training_tool(
     max_experiments: int,
     required_dataset: str | None = None,
     training_fn=run_training,
+    attempt_log: list[dict] | None = None,
 ):
     """Create the only production tool that launches campaign GPU training."""
     runner = CampaignRunner(
@@ -672,7 +673,7 @@ def make_registered_training_tool(
         campaign_id=campaign_id,
         seed=seed,
         max_experiments=max_experiments,
-        executor=lambda dataset_id, configuration, run_seed: _real_training_result(
+        executor=lambda dataset_id, configuration, run_seed: execute_registered_training(
             dataset_id, configuration, run_seed, training_fn=training_fn
         ),
     )
@@ -690,11 +691,14 @@ def make_registered_training_tool(
     ) -> dict:
         """Run one real train/validation experiment within the campaign budget."""
         if required_dataset is not None and dataset_id != required_dataset:
-            return {
+            response = {
                 "status": "rejected",
                 "error_code": "DATASET_NOT_ALLOWED",
                 "message": f"This campaign is restricted to {required_dataset}.",
             }
+            if attempt_log is not None:
+                attempt_log.append({"configuration": None, "response": response})
+            return response
         configuration = {
             "architecture": model_id,
             "learning_rate": learning_rate,
@@ -723,13 +727,19 @@ def make_registered_training_tool(
                     f"batch_size exceeds limit {model_spec.conservative_batch_size}."
                 )
         except Exception as exc:
-            return {
+            response = {
                 "status": "rejected",
                 "error_code": "INVALID_MODEL_CONFIGURATION",
                 "message": str(exc),
             }
+            if attempt_log is not None:
+                attempt_log.append({"configuration": configuration, "response": response})
+            return response
 
-        return runner.run(dataset_id, configuration)
+        response = runner.run(dataset_id, configuration)
+        if attempt_log is not None:
+            attempt_log.append({"configuration": configuration, "response": response})
+        return response
 
     return run_campaign_experiment
 
