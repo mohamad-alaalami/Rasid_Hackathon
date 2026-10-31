@@ -6,7 +6,7 @@ import time
 import torch
 from strands import tool
 
-from agent.feedback import build_feedback
+from agent.feedback import build_campaign_report, build_feedback
 from agent.campaign import CampaignRunner
 from agent.experiments import (
     finalize_training,
@@ -803,21 +803,11 @@ def make_campaign_diagnostics_tool(version: str, campaign_id: str, seed: int):
 def make_campaign_report_tool(version: str, campaign_id: str, seed: int):
     @tool
     def get_campaign_report() -> dict:
-        """Return every factual campaign result and the best real checkpoint."""
+        """Return mode-filtered factual results and the best real checkpoint."""
         records = load_campaign_experiments(version, campaign_id, seed)
         datasets = sorted({run["dataset"] for run in records})
         best = None
         if len(datasets) == 1:
             best = get_best_experiment(version, campaign_id, datasets[0], seed)
-        return {
-            "campaign_id": campaign_id,
-            "feedback_version": version,
-            "dataset_id": datasets[0] if len(datasets) == 1 else None,
-            "experiments": records,
-            "best_experiment_id": best.get("experiment_id") if best else None,
-            "best_validation_score": best.get("validation_score") if best else None,
-            "best_checkpoint_path": best.get("checkpoint_path") if best else None,
-            "completed": sum(run["status"] == "completed" for run in records),
-            "failed": sum(run["status"] == "failed" for run in records),
-        }
+        return build_campaign_report(version, campaign_id, records, best)
     return get_campaign_report

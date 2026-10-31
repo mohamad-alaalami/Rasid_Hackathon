@@ -18,6 +18,69 @@ FEEDBACK_VERSIONS = {
 }
 
 
+def build_report_experiment(version, record):
+    """Return only fields that the selected feedback mode may observe."""
+    if version not in FEEDBACK_VERSIONS:
+        raise ValueError(f"Unknown feedback version: {version}")
+
+    visible = {
+        "experiment_id": record.get("experiment_id"),
+        "dataset_id": record.get("dataset"),
+        "configuration": record.get("configuration"),
+        "status": record.get("status"),
+        "primary_metric": record.get("primary_metric"),
+        "validation_score": record.get("validation_score"),
+        "runtime_seconds": record.get("runtime_seconds"),
+        "training_seconds": record.get("training_seconds"),
+        "checkpoint_path": record.get("checkpoint_path"),
+        "error": record.get("error"),
+    }
+
+    if version in {"E1", "E2", "E3"}:
+        visible["training_diagnostics"] = {
+            "train_loss": record.get("train_loss"),
+            "validation_loss": record.get("val_loss"),
+            "validation_metric_curve": record.get("validation_metric_curve"),
+        }
+
+    if version == "E3":
+        diagnostics = record.get("detailed_diagnostics") or {}
+        visible["detailed_diagnostics_available"] = sorted(diagnostics)
+
+    return visible
+
+
+def build_campaign_report(version, campaign_id, records, best=None):
+    """Build a campaign report without bypassing E0-E3 isolation rules."""
+    if version not in FEEDBACK_VERSIONS:
+        raise ValueError(f"Unknown feedback version: {version}")
+
+    datasets = sorted({record["dataset"] for record in records})
+    visible_records = records if version in {"E2", "E3"} else records[-1:]
+    report = {
+        "campaign_id": campaign_id,
+        "feedback_version": version,
+        "dataset_id": datasets[0] if len(datasets) == 1 else None,
+        "experiments": [
+            build_report_experiment(version, record)
+            for record in visible_records
+        ],
+    }
+
+    # Aggregate history and best-run comparisons are experiment memory, so they
+    # are deliberately unavailable to E0 and E1.
+    if version in {"E2", "E3"}:
+        report.update({
+            "best_experiment_id": best.get("experiment_id") if best else None,
+            "best_validation_score": best.get("validation_score") if best else None,
+            "best_checkpoint_path": best.get("checkpoint_path") if best else None,
+            "completed": sum(run["status"] == "completed" for run in records),
+            "failed": sum(run["status"] == "failed" for run in records),
+        })
+
+    return report
+
+
 def summarize_curve(values, higher_is_better=False):
     """Summarize epoch-by-epoch training metrics."""
 
