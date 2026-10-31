@@ -1,0 +1,17 @@
+{
+  "model": "resnet18",
+  "pretrained": true,
+  "input_mode": "rgb",
+  "epochs": 1,
+  "batch_size": 32,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.0001,
+  "seed": 42,
+  "num_workers": 2,
+  "mixed_precision": true,
+  "device": "auto",
+  "output_dir": "experiments",
+  "benchmark_dir": null,
+  "image_size": 64
+}
+
