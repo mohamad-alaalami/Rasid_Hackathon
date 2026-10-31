@@ -25,7 +25,9 @@ class TrainingConfig:
     benchmark_dir: str | None = None
     checkpoint_dir: str = "checkpoints"
     pretrained_checkpoint: str | None = None
-    image_size: int = 64
+    # None preserves the dataset's verified native resolution. Set an integer
+    # only for an intentional square resize experiment.
+    image_size: int | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "TrainingConfig":
@@ -48,12 +50,21 @@ class TrainingConfig:
             "benchmark_dir": (str, type(None)),
             "checkpoint_dir": str,
             "pretrained_checkpoint": (str, type(None)),
-            "image_size": int,
+            "image_size": (int, type(None)),
         }
         for name, value in raw.items():
             expected = expected_types[name]
+            numeric_fields = {
+                "epochs",
+                "batch_size",
+                "learning_rate",
+                "weight_decay",
+                "seed",
+                "num_workers",
+                "image_size",
+            }
             if not isinstance(value, expected) or (
-                expected in {int, Real} and isinstance(value, bool)
+                name in numeric_fields and isinstance(value, bool)
             ):
                 raise TypeError(
                     f"{name} has invalid type {type(value).__name__}; expected {expected}."
@@ -78,7 +89,7 @@ class TrainingConfig:
             raise ValueError("weight_decay cannot be negative.")
         if self.num_workers < 0:
             raise ValueError("num_workers cannot be negative.")
-        if self.image_size < 32:
+        if self.image_size is not None and self.image_size < 32:
             raise ValueError("image_size must be at least 32.")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be 'auto', 'cpu', or 'cuda'.")

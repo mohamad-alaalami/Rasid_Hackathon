@@ -77,6 +77,7 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     log_path = experiment_dir / "error.log"
     _json_write(config_path, {"dataset_id": dataset_id, **cfg.to_dict()})
     started = time.perf_counter()
+    data = None
 
     try:
         import torch
@@ -84,13 +85,22 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         from .dataset import create_dataloaders
         from .evaluate import evaluate_model
         from .model_registry import get_model_spec, model_runtime_status
-        from .models import create_model, model_logits
+        from .models import create_model, model_logits, validate_model_output_shape
 
         _seed_everything(cfg.seed)
         device = _select_device(cfg.device)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         data = create_dataloaders(dataset_id, cfg)
+        _json_write(
+            config_path,
+            {
+                "dataset_id": dataset_id,
+                **cfg.to_dict(),
+                "native_resolution": list(data.native_resolution),
+                "effective_resolution": list(data.effective_resolution),
+            },
+        )
         model_spec = get_model_spec(selected_model)
         model_environment = model_runtime_status(selected_model, cfg.checkpoint_dir)
         pretrained_checkpoint = cfg.pretrained_checkpoint
@@ -130,6 +140,7 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
                     logits = model_logits(model(images), data.task_type)
+                    validate_model_output_shape(logits, labels, data.task_type)
                     loss = criterion(logits, labels)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -152,6 +163,8 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
                 "epoch": epoch,
                 "train_loss": loss_total / seen,
                 "learning_rate": optimizer.param_groups[0]["lr"],
+                "native_resolution": list(data.native_resolution),
+                "effective_resolution": list(data.effective_resolution),
                 **{f"val_{key}": value for key, value in validation.items()},
             }
             history.append(epoch_metrics)
@@ -190,6 +203,8 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             "model": selected_model,
             "task_type": data.task_type,
             "input_mode": cfg.input_mode,
+            "native_resolution": list(data.native_resolution),
+            "effective_resolution": list(data.effective_resolution),
             "best_epoch": best_epoch,
             "primary_metric": data.primary_metric,
             "best_val_score": best_accuracy,
@@ -215,16 +230,25 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         return result
     except Exception as exc:
         log_path.write_text(traceback.format_exc(), encoding="utf-8")
+        message = str(exc)
+        if _error_type(exc) == "CUDA_OUT_OF_MEMORY":
+            message += (
+                " The engine kept the requested resolution unchanged. Retry with a smaller "
+                "batch_size, or set image_size explicitly for a deliberate resize experiment."
+            )
         result = {
             "status": "failed",
             "experiment_id": experiment_id,
             "dataset_id": dataset_id,
             "error_type": _error_type(exc),
-            "message": str(exc),
+            "message": message,
             "training_seconds": round(time.perf_counter() - started, 3),
             "log_path": str(log_path),
             "config_path": str(config_path),
         }
+        if data is not None:
+            result["native_resolution"] = list(data.native_resolution)
+            result["effective_resolution"] = list(data.effective_resolution)
         _json_write(experiment_dir / "result.json", result)
         return result
 

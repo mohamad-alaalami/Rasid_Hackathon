@@ -17,6 +17,11 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, help="Override config epoch count.")
     parser.add_argument("--batch-size", type=int, help="Override config batch size.")
     parser.add_argument("--checkpoint-dir", help="Directory containing exact external checkpoints.")
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        help="Explicit square resize override; omitted preserves native resolution.",
+    )
     args = parser.parse_args()
     config = json.loads(Path(args.config).read_text(encoding="utf-8"))
     if args.model:
@@ -27,6 +32,8 @@ def main() -> None:
         config["batch_size"] = args.batch_size
     if args.checkpoint_dir:
         config["checkpoint_dir"] = args.checkpoint_dir
+    if args.image_size is not None:
+        config["image_size"] = args.image_size
     result = train_model(args.dataset_id, config)
     print(json.dumps(result, indent=2))
     raise SystemExit(0 if result["status"] == "completed" else 1)

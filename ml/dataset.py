@@ -78,14 +78,14 @@ class GeoBenchDataset:
         spec: DatasetSpec,
         band_indices: tuple[int, ...],
         normalization: str,
-        image_size: int,
+        effective_resolution: tuple[int, int],
         augment: bool,
     ):
         self.dataset = dataset
         self.spec = spec
         self.band_indices = band_indices
         self.normalization = normalization
-        self.image_size = image_size
+        self.effective_resolution = effective_resolution
         self.augment = augment
 
     def __len__(self) -> int:
@@ -137,13 +137,19 @@ class GeoBenchDataset:
         import torch
         import torch.nn.functional as functional
 
-        if tuple(image.shape[-2:]) != (self.image_size, self.image_size):
+        if tuple(image.shape[-2:]) != self.effective_resolution:
             image = functional.interpolate(
-                image[None], size=(self.image_size, self.image_size), mode="bilinear", align_corners=False
+                image[None],
+                size=self.effective_resolution,
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
             )[0]
             if self.spec.task_type == "segmentation":
                 target = functional.interpolate(
-                    target[None, None].float(), size=(self.image_size, self.image_size), mode="nearest"
+                    target[None, None].float(),
+                    size=self.effective_resolution,
+                    mode="nearest",
                 )[0, 0].long()
         if self.augment and torch.rand(()) < 0.5:
             image = torch.flip(image, dims=(-1,))
@@ -166,7 +172,49 @@ class DataBundle:
     class_names: list[str]
     ignore_index: int | None
     primary_metric: str
+    native_resolution: tuple[int, int]
+    effective_resolution: tuple[int, int]
     preprocessing: dict[str, Any]
+
+
+def inspect_sample_resolution(
+    sample: Any,
+    spec: DatasetSpec,
+    band_indices: tuple[int, ...],
+) -> tuple[int, int]:
+    """Read and validate a real sample's spatial dimensions."""
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("numpy is required to inspect dataset resolution.") from exc
+    bands = getattr(sample, "bands", None)
+    if bands is None or max(band_indices) >= len(bands):
+        raise TypeError(
+            f"{spec.dataset_id} requires band indices {band_indices}; "
+            f"sample has {0 if bands is None else len(bands)} bands."
+        )
+    shapes = [tuple(np.asarray(_band_array(bands[i])).squeeze().shape) for i in band_indices]
+    if not shapes or any(len(shape) != 2 for shape in shapes):
+        raise ValueError(f"Expected 2D image bands, received shapes {shapes}.")
+    if any(shape != shapes[0] for shape in shapes[1:]):
+        raise ValueError(f"Image bands are not spatially aligned: {shapes}.")
+    resolution = shapes[0]
+    if spec.task_type == "segmentation":
+        mask_shape = tuple(np.asarray(_band_array(getattr(sample, "label", None))).squeeze().shape)
+        if mask_shape != resolution:
+            raise ValueError(
+                f"Segmentation image/mask mismatch for {spec.dataset_id}: "
+                f"image={resolution}, mask={mask_shape}."
+            )
+    return resolution
+
+
+def resolve_effective_resolution(
+    spec: DatasetSpec,
+    image_size: int | None,
+) -> tuple[int, int]:
+    """Use native dimensions unless the experiment explicitly overrides them."""
+    return spec.native_resolution if image_size is None else (image_size, image_size)
 
 
 def create_dataloaders(dataset_id: str, config) -> DataBundle:
@@ -198,11 +246,20 @@ def create_dataloaders(dataset_id: str, config) -> DataBundle:
     # are known to be wrong even though the pixel order is valid.
     train_source = task.get_dataset(split="train", band_names=None)
     val_source = task.get_dataset(split="valid", band_names=None)
+    train_resolution = inspect_sample_resolution(train_source[0], spec, band_indices)
+    val_resolution = inspect_sample_resolution(val_source[0], spec, band_indices)
+    if train_resolution != spec.native_resolution or val_resolution != spec.native_resolution:
+        raise ValueError(
+            f"Registry native resolution for {dataset_id} is {spec.native_resolution}, "
+            f"but actual train/validation samples are {train_resolution}/{val_resolution}. "
+            "Update the verified registry contract; no implicit resize was performed."
+        )
+    effective_resolution = resolve_effective_resolution(spec, config.image_size)
     train_dataset = GeoBenchDataset(
-        train_source, spec, band_indices, normalization, config.image_size, augment=True
+        train_source, spec, band_indices, normalization, effective_resolution, augment=True
     )
     val_dataset = GeoBenchDataset(
-        val_source, spec, band_indices, normalization, config.image_size, augment=False
+        val_source, spec, band_indices, normalization, effective_resolution, augment=False
     )
     generator = torch.Generator().manual_seed(config.seed)
     loader_kwargs = dict(
@@ -232,11 +289,20 @@ def create_dataloaders(dataset_id: str, config) -> DataBundle:
         class_names=class_names,
         ignore_index=spec.ignore_index,
         primary_metric=spec.primary_metric,
+        native_resolution=spec.native_resolution,
+        effective_resolution=effective_resolution,
         preprocessing={
             "input_profile": model_spec.input_profile,
             "band_indices": list(band_indices),
             "scale_divisor": spec.scale_divisor,
             "normalization": normalization,
-            "image_size": config.image_size,
+            "native_resolution": list(spec.native_resolution),
+            "effective_resolution": list(effective_resolution),
+            "resolution_override": config.image_size,
+            "resize_applied": effective_resolution != spec.native_resolution,
+            "image_interpolation": "bilinear with antialiasing",
+            "mask_interpolation": (
+                "nearest" if spec.task_type == "segmentation" else None
+            ),
         },
     )

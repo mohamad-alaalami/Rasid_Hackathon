@@ -20,13 +20,14 @@ def run_smoke_test(
     checkpoint_dir: str = "checkpoints",
     pretrained_checkpoint: str | None = None,
     pretrained: bool = True,
+    image_size: int | None = None,
 ) -> dict[str, Any]:
     """Run one train batch and one validation batch without touching test data."""
     import torch
 
     from .dataset import create_dataloaders
     from .evaluate import evaluate_model
-    from .models import create_model, model_logits
+    from .models import create_model, model_logits, validate_model_output_shape
     from .model_registry import get_model_spec
 
     config = TrainingConfig.from_mapping(
@@ -42,6 +43,7 @@ def run_smoke_test(
             "benchmark_dir": benchmark_dir,
             "checkpoint_dir": checkpoint_dir,
             "pretrained_checkpoint": pretrained_checkpoint,
+            "image_size": image_size,
         }
     )
     model_name = config.validate_for_dataset(dataset_id)
@@ -75,6 +77,7 @@ def run_smoke_test(
     model.train()
     optimizer.zero_grad(set_to_none=True)
     train_logits = model_logits(model(train_images), data.task_type)
+    validate_model_output_shape(train_logits, train_targets, data.task_type)
     train_loss = criterion(train_logits, train_targets)
     train_loss.backward()
     optimizer.step()
@@ -114,6 +117,9 @@ def run_smoke_test(
         "device": str(device),
         "input_channels": data.input_channels,
         "num_classes": data.num_classes,
+        "native_resolution": list(data.native_resolution),
+        "effective_resolution": list(data.effective_resolution),
+        "resolution_override": image_size,
         "train_image_shape": list(train_images.shape),
         "train_target_shape": list(train_targets.shape),
         "output_shape": list(train_logits.shape),
@@ -136,6 +142,11 @@ def main() -> None:
     parser.add_argument("--benchmark-dir")
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--pretrained-checkpoint")
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        help="Explicit square resize for a deliberate memory experiment; native is default.",
+    )
     parser.add_argument("--no-pretrained", action="store_true")
     args = parser.parse_args()
     try:
@@ -147,6 +158,7 @@ def main() -> None:
             checkpoint_dir=args.checkpoint_dir,
             pretrained_checkpoint=args.pretrained_checkpoint,
             pretrained=not args.no_pretrained,
+            image_size=args.image_size,
         )
     except Exception as exc:
         result = {

@@ -15,6 +15,7 @@ class DatasetSpec:
     band_indices: tuple[int, ...]
     scale_divisor: float
     primary_metric: str
+    native_resolution: tuple[int, int]
     ignore_index: int | None = None
 
     @property
@@ -36,6 +37,7 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         band_indices=(3, 2, 1),
         scale_divisor=10000.0,
         primary_metric="accuracy",
+        native_resolution=(64, 64),
     ),
     "m-pv4ger": DatasetSpec(
         dataset_id="m-pv4ger",
@@ -46,6 +48,7 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         band_indices=(0, 1, 2),  # native aerial RGB order
         scale_divisor=255.0,
         primary_metric="accuracy",
+        native_resolution=(320, 320),
     ),
     "m-pv4ger-seg": DatasetSpec(
         dataset_id="m-pv4ger-seg",
@@ -56,6 +59,7 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         band_indices=(0, 1, 2),
         scale_divisor=255.0,
         primary_metric="mean_iou",
+        native_resolution=(320, 320),
     ),
     "m-chesapeake": DatasetSpec(
         dataset_id="m-chesapeake",
@@ -66,6 +70,7 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         band_indices=(0, 1, 2, 3),  # native aerial RGB+NIR order
         scale_divisor=255.0,
         primary_metric="mean_iou",
+        native_resolution=(256, 256),
     ),
 }
 
@@ -90,6 +95,11 @@ def list_dataset_specs() -> list[dict]:
             "available_channels": spec.available_channels,
             "input_channels": spec.input_channels,
             "primary_metric": spec.primary_metric,
+            "native_resolution": list(spec.native_resolution),
+            "supported_resolution_options": {
+                "default": "native",
+                "override": "explicit square image_size >= 32",
+            },
         }
         for spec in DATASET_REGISTRY.values()
     ]

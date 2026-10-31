@@ -16,6 +16,14 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", default="checkpoints")
     parser.add_argument("--output", default="artifacts/smoke_matrix.json")
     parser.add_argument("--include-legacy", action="store_true")
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        help=(
+            "Explicit square resolution for memory-constrained smoke testing. "
+            "Omit to test every dataset at native resolution."
+        ),
+    )
     args = parser.parse_args()
 
     records = []
@@ -41,6 +49,7 @@ def main() -> None:
                     model_id=option["model_id"],
                     batch_size=batch_size,
                     checkpoint_dir=args.checkpoint_dir,
+                    image_size=args.image_size,
                 )
             except Exception as exc:
                 result = {

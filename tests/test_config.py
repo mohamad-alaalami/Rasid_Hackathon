@@ -8,6 +8,11 @@ class TrainingConfigTests(unittest.TestCase):
         config = TrainingConfig.from_mapping({"epochs": 1})
         self.assertEqual(config.model, "resnet18_rgb")
         self.assertEqual(config.epochs, 1)
+        self.assertIsNone(config.image_size)
+
+    def test_image_size_override_is_optional_and_explicit(self):
+        config = TrainingConfig.from_mapping({"image_size": 128})
+        self.assertEqual(config.image_size, 128)
 
     def test_unknown_keys_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unsupported configuration keys"):

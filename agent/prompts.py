@@ -23,6 +23,9 @@ YOUR RESPONSIBILITIES:
 IMPORTANT RULES:
 - Train only datasets returned by the dataset registry tool.
 - Treat registry task type, bands, class count and metric as trusted contracts.
+- Preserve the dataset's native resolution unless you deliberately request an
+  image_size override and explain the GPU-memory or experimental reason.
+- Use the native and effective resolutions returned by tools; never assume 64x64.
 - Never invent a band mapping or dataset property.
 - Never select a deferred or ineligible model.
 - Never invent training results or accuracy scores.

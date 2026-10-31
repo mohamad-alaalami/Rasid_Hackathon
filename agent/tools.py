@@ -81,6 +81,7 @@ def train_registered_model(
     weight_decay: float = 0.0001,
     pretrained: bool = True,
     seed: int = 42,
+    image_size: int | None = None,
 ) -> dict:
     """Train one safe experiment for a registered classification or segmentation dataset.
 
@@ -119,5 +120,6 @@ def train_registered_model(
             "seed": seed,
             "device": "auto",
             "mixed_precision": True,
+            "image_size": image_size,
         },
     )

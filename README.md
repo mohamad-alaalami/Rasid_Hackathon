@@ -30,6 +30,12 @@ python -m ml.smoke_test --dataset-id m-pv4ger-seg --model fcn_resnet50
 python -m ml.smoke_test --dataset-id m-chesapeake --model fcn_resnet50
 ```
 
+Smoke tests and training preserve each dataset's verified native resolution by
+default: EuroSAT 64x64, PV4GER/PV4GER-Seg 320x320, and Chesapeake 256x256.
+Use `--image-size N` only as an explicit square resize experiment (for example,
+after a native-resolution GPU out-of-memory result); the image uses bilinear
+interpolation and segmentation masks use nearest-neighbor interpolation.
+
 Training uses only `train` and `valid`. The test split is reserved for one final evaluation.
 
 ## Model selection

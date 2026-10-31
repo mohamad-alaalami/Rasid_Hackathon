@@ -198,3 +198,25 @@ def model_logits(output, task_type: str):
             raise TypeError("Segmentation model output dictionary lacks 'out'.")
         return output["out"]
     return output
+
+
+def validate_model_output_shape(logits, targets, task_type: str) -> None:
+    """Reject models that cannot preserve the requested task dimensions."""
+    if task_type == "classification":
+        if logits.ndim != 2 or targets.ndim != 1 or logits.shape[0] != targets.shape[0]:
+            raise ValueError(
+                f"Unsupported classification output/target shapes: "
+                f"{tuple(logits.shape)}/{tuple(targets.shape)}."
+            )
+        return
+    if logits.ndim != 4 or targets.ndim != 3:
+        raise ValueError(
+            f"Unsupported segmentation output/target ranks: "
+            f"{tuple(logits.shape)}/{tuple(targets.shape)}."
+        )
+    if logits.shape[0] != targets.shape[0] or tuple(logits.shape[-2:]) != tuple(targets.shape[-2:]):
+        raise ValueError(
+            "The segmentation model does not preserve the requested effective "
+            f"resolution: output={tuple(logits.shape)}, target={tuple(targets.shape)}. "
+            "Choose a supported model/resolution or an explicit image_size override."
+        )
