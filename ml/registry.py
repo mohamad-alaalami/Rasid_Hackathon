@@ -11,6 +11,7 @@ class DatasetSpec:
     task_type: str
     benchmark_name: str
     num_classes: int
+    available_channels: int
     band_indices: tuple[int, ...]
     scale_divisor: float
     default_model: str
@@ -30,9 +31,10 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         task_type="classification",
         benchmark_name="classification_v1.0",
         num_classes=10,
-        # All 13 channels, reordered so the pretrained RGB stem receives
-        # verified B04/B03/B02 first; remaining channels follow afterward.
-        band_indices=(3, 2, 1, 0, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+        available_channels=13,
+        # Preserve the verified ImageNet-pretrained RGB baseline. The dataset
+        # contains 13 bands, but this experiment profile selects B04/B03/B02.
+        band_indices=(3, 2, 1),
         scale_divisor=10000.0,
         default_model="resnet18",
         primary_metric="accuracy",
@@ -42,6 +44,7 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         task_type="classification",
         benchmark_name="classification_v1.0",
         num_classes=2,
+        available_channels=3,
         band_indices=(0, 1, 2),  # native aerial RGB order
         scale_divisor=255.0,
         default_model="resnet18",
@@ -52,6 +55,7 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         task_type="segmentation",
         benchmark_name="segmentation_v1.0",
         num_classes=2,
+        available_channels=3,
         band_indices=(0, 1, 2),
         scale_divisor=255.0,
         default_model="fcn_resnet50",
@@ -62,6 +66,7 @@ DATASET_REGISTRY: dict[str, DatasetSpec] = {
         task_type="segmentation",
         benchmark_name="segmentation_v1.0",
         num_classes=7,
+        available_channels=4,
         band_indices=(0, 1, 2, 3),  # native aerial RGB+NIR order
         scale_divisor=255.0,
         default_model="fcn_resnet50",
@@ -87,6 +92,7 @@ def list_dataset_specs() -> list[dict]:
             "task_type": spec.task_type,
             "benchmark_name": spec.benchmark_name,
             "num_classes": spec.num_classes,
+            "available_channels": spec.available_channels,
             "input_channels": spec.input_channels,
             "default_model": spec.default_model,
             "primary_metric": spec.primary_metric,

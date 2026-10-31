@@ -5,7 +5,7 @@ The same `ml.train_model` API powers terminal runs and agent tool calls.
 
 Registered datasets:
 
-- `m-eurosat`: 10-class classification using all 13 Sentinel-2 channels
+- `m-eurosat`: 10-class classification; 13 bands available, verified RGB baseline selected
 - `m-pv4ger`: binary aerial-RGB classification
 - `m-pv4ger-seg`: binary aerial-RGB segmentation
 - `m-chesapeake`: 7-class aerial RGB+NIR segmentation
