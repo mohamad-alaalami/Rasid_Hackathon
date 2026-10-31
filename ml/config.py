@@ -10,9 +10,9 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    model: str = "resnet18"
+    model: str = "auto"
     pretrained: bool = True
-    input_mode: str = "rgb"
+    input_mode: str = "registry"
     epochs: int = 5
     batch_size: int = 32
     learning_rate: float = 3e-4
@@ -59,10 +59,10 @@ class TrainingConfig:
         return config
 
     def validate(self) -> None:
-        if self.model != "resnet18":
-            raise ValueError("Initial engine supports only model='resnet18'.")
-        if self.input_mode != "rgb":
-            raise ValueError("Initial engine supports only input_mode='rgb'.")
+        if self.model not in {"auto", "resnet18", "fcn_resnet50"}:
+            raise ValueError("model must be 'auto', 'resnet18', or 'fcn_resnet50'.")
+        if self.input_mode != "registry":
+            raise ValueError("input_mode must be 'registry'; dataset channels come from ml/registry.py.")
         if self.epochs < 1:
             raise ValueError("epochs must be at least 1.")
         if self.batch_size < 1:
@@ -79,6 +79,22 @@ class TrainingConfig:
             raise ValueError("device must be 'auto', 'cpu', or 'cuda'.")
         if self.benchmark_dir is not None and not Path(self.benchmark_dir).is_dir():
             raise ValueError(f"benchmark_dir does not exist: {self.benchmark_dir}")
+
+    def validate_for_dataset(self, dataset_id: str) -> str:
+        from .registry import get_dataset_spec
+
+        spec = get_dataset_spec(dataset_id)
+        selected_model = spec.default_model if self.model == "auto" else self.model
+        allowed = {
+            "classification": {"resnet18"},
+            "segmentation": {"fcn_resnet50"},
+        }[spec.task_type]
+        if selected_model not in allowed:
+            raise ValueError(
+                f"model={selected_model!r} is incompatible with "
+                f"dataset={dataset_id!r} ({spec.task_type})."
+            )
+        return selected_model
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

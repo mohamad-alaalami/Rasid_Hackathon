@@ -5,9 +5,10 @@ from strands.models import BedrockModel
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
     agent_capabilities,
+    inspect_dataset,
     inspect_gpu,
-    inspect_m_eurosat,
-    train_m_eurosat_model,
+    list_supported_datasets,
+    train_registered_model,
 )
 
 
@@ -30,8 +31,9 @@ def create_agent():
         tools=[
             agent_capabilities,
             inspect_gpu,
-            inspect_m_eurosat,
-            train_m_eurosat_model,
+            list_supported_datasets,
+            inspect_dataset,
+            train_registered_model,
         ]
     )
 
@@ -51,25 +53,28 @@ if __name__ == "__main__":
     # Initialize the agent
     agent = create_agent()
 
-    # Ask Claude to use both tools
+    # Run a bounded end-to-end smoke test through the generic tools.
     agent(
         """
         You are GoTrain, an autonomous geospatial ML agent.
 
-        First, call the agent_capabilities tool.
+        Complete this workflow in order:
 
-        Second, call the inspect_gpu tool.
-
-        Then report:
-        1. Your currently available capabilities.
-        2. The GPU name.
-        3. Total GPU memory.
-        4. Free GPU memory.
-        5. CUDA version.
-        6. Which ML features still need implementation.
+        1. Call agent_capabilities.
+        2. Call inspect_gpu.
+        3. Call list_supported_datasets.
+        4. Call inspect_dataset with dataset_id "m-eurosat".
+        5. If those checks succeed, call train_registered_model once for
+           "m-eurosat" with epochs=1, batch_size=32,
+           learning_rate=0.0003, weight_decay=0.0001,
+           pretrained=true, and seed=42.
+        6. Report the task type, primary validation metric, training time,
+           checkpoint path, and experiment ID.
+        7. Explain whether the run succeeded and recommend one next experiment.
 
         Use real tool outputs only.
-        Do not invent any information.
+        Never invent metrics and never access the test split.
+        Do not run more than one training experiment during this smoke test.
         """
     )
 

@@ -55,10 +55,9 @@ def _error_type(exc: Exception) -> str:
 
 
 def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
-    """Train one controlled classification experiment and return JSON-safe metadata."""
+    """Train one registered classification or segmentation experiment."""
     cfg = TrainingConfig.from_mapping(config)
-    if dataset_id != "m-eurosat":
-        raise ValueError("Initial engine supports only dataset_id='m-eurosat'.")
+    selected_model = cfg.validate_for_dataset(dataset_id)
 
     experiment_id = datetime.now(timezone.utc).strftime("exp_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
     experiment_dir = Path(cfg.output_dir).expanduser().resolve() / experiment_id
@@ -74,14 +73,23 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         import torch
 
         from .dataset import create_dataloaders
-        from .evaluate import evaluate_classifier
-        from .models import create_model
+        from .evaluate import evaluate_model
+        from .models import create_model, model_logits
 
         _seed_everything(cfg.seed)
         device = _select_device(cfg.device)
         data = create_dataloaders(dataset_id, cfg)
-        model = create_model(cfg.model, data.num_classes, cfg.pretrained).to(device)
-        criterion = torch.nn.CrossEntropyLoss()
+        model = create_model(
+            selected_model,
+            data.task_type,
+            data.num_classes,
+            data.input_channels,
+            cfg.pretrained,
+        ).to(device)
+        criterion_kwargs = {}
+        if data.ignore_index is not None:
+            criterion_kwargs["ignore_index"] = data.ignore_index
+        criterion = torch.nn.CrossEntropyLoss(**criterion_kwargs)
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
         )
@@ -101,40 +109,50 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
                 labels = labels.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=amp_enabled):
-                    logits = model(images)
+                    logits = model_logits(model(images), data.task_type)
                     loss = criterion(logits, labels)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-                batch_size = labels.size(0)
-                loss_total += float(loss.item()) * batch_size
-                seen += batch_size
+                item_count = labels.size(0)
+                loss_total += float(loss.item()) * item_count
+                seen += item_count
             scheduler.step()
-            validation = evaluate_classifier(model, data.val_loader, criterion, device)
+            validation = evaluate_model(
+                model,
+                data.val_loader,
+                criterion,
+                device,
+                data.task_type,
+                data.num_classes,
+                data.ignore_index,
+            )
+            score = validation[data.primary_metric]
             epoch_metrics = {
                 "epoch": epoch,
                 "train_loss": loss_total / seen,
-                "val_loss": validation["loss"],
-                "val_accuracy": validation["accuracy"],
                 "learning_rate": optimizer.param_groups[0]["lr"],
+                **{f"val_{key}": value for key, value in validation.items()},
             }
             history.append(epoch_metrics)
             _json_write(metrics_path, history)
-            if validation["accuracy"] > best_accuracy:
-                best_accuracy = validation["accuracy"]
+            if score > best_accuracy:
+                best_accuracy = score
                 best_epoch = epoch
                 torch.save(
                     {
                         "model_state_dict": model.state_dict(),
-                        "model_name": cfg.model,
+                        "model_name": selected_model,
                         "dataset_id": dataset_id,
+                        "task_type": data.task_type,
                         "num_classes": data.num_classes,
                         "class_names": data.class_names,
                         "preprocessing": data.preprocessing,
                         "config": cfg.to_dict(),
                         "seed": cfg.seed,
                         "best_epoch": best_epoch,
-                        "best_val_accuracy": best_accuracy,
+                        "primary_metric": data.primary_metric,
+                        "best_val_score": best_accuracy,
                     },
                     checkpoint_path,
                 )
@@ -143,16 +161,19 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             "status": "completed",
             "experiment_id": experiment_id,
             "dataset_id": dataset_id,
-            "model": cfg.model,
+            "model": selected_model,
+            "task_type": data.task_type,
             "input_mode": cfg.input_mode,
             "best_epoch": best_epoch,
-            "best_val_accuracy": best_accuracy,
+            "primary_metric": data.primary_metric,
+            "best_val_score": best_accuracy,
             "training_seconds": round(time.perf_counter() - started, 3),
             "device": str(device),
             "checkpoint_path": str(checkpoint_path),
             "metrics_path": str(metrics_path),
             "config_path": str(config_path),
         }
+        result[f"best_val_{data.primary_metric}"] = best_accuracy
         _json_write(experiment_dir / "result.json", result)
         return result
     except Exception as exc:

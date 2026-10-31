@@ -1,7 +1,7 @@
 {
   "model": "resnet18",
   "pretrained": true,
-  "input_mode": "rgb",
+  "input_mode": "registry",
   "epochs": 1,
   "batch_size": 32,
   "learning_rate": 0.0003,
