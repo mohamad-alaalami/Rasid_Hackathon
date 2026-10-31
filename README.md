@@ -129,3 +129,54 @@ python -m ml.smoke_matrix --include-legacy
 The command saves factual runtime and peak-memory results to
 `artifacts/smoke_matrix.json`. Models with missing dependencies or checkpoints are
 recorded as skipped, not silently initialized.
+
+## Dataset and model-version store
+
+GoTrain can keep datasets, trained model versions, and agent logs in Amazon S3
+(or any shared directory) instead of only the notebook folder. It is disabled
+unless `GOTRAIN_STORE` is set; without it, training, tools, and prompts are unchanged.
+
+```bash
+export GOTRAIN_STORE=s3://<bucket>/gotrain   # or a directory such as ~/gotrain-store
+python -m storage doctor                     # checks access; suggests the SageMaker default bucket
+```
+
+When enabled:
+
+- Every completed training run is uploaded automatically as the next numbered
+  version of its dataset (`m-eurosat/v0003`): checkpoint, config, metrics, and a
+  provenance record with the validation score, experiment ID, and git commit.
+  Upload problems are reported in the result and never fail a finished run.
+- Campaign agents get `model_store_status`, `sync_dataset` (download a dataset
+  if this instance lacks it, upload it if the store lacks it) and
+  `upload_experiment`. E2/E3 campaigns also get `list_model_versions`,
+  `get_model_version`, `promote_model_version`, and `download_model_version`;
+  E0/E1 do not, because version history would break their no-history contract.
+  The controlled comparison runners never receive store tools.
+
+Store layout:
+
+```text
+datasets/<benchmark>/<dataset>.tar (+ .manifest.json with SHA-256)
+models/<dataset>/v0001/{version.json, best.pt, config.json, metrics.json, training_result.json}
+models/<dataset>/champion.json          current champion + promotion history
+models/<dataset>/test_evaluation.json   the one-time final test result
+logs/{artifacts,experiments}/...        campaign logs and experiment records
+```
+
+Human commands (`python -m storage <command>`):
+
+```bash
+python -m storage push-dataset m-eurosat          # pull-dataset on another instance
+python -m storage register --all                  # version experiments trained before the store
+python -m storage versions m-eurosat
+python -m storage promote m-eurosat 3 --reason "best validation accuracy"
+python -m storage final-test m-eurosat --yes      # champion only, once per dataset
+python -m storage summary                         # champion, validation and test score per dataset
+python -m storage push-logs
+```
+
+`final-test` is the only path to the test split. It evaluates the champion with
+the exact preprocessing stored in its checkpoint, records the result, and locks the
+dataset: a second test evaluation or a later promotion is refused. If a run crashes
+before reporting metrics, retry with `--retry-unfinished`.

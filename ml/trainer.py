@@ -61,6 +61,13 @@ def _update_early_stopping(score, reference_score, epochs_without_improvement, m
     return reference_score, epochs_without_improvement + 1
 
 
+def _publish_model_version(result: dict[str, Any], experiment_dir: Path) -> dict[str, Any]:
+    """Version the run in $GOTRAIN_STORE when configured; returns {} otherwise."""
+    from storage.model_versions import publish_experiment
+
+    return publish_experiment(result, experiment_dir)
+
+
 def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     """Train one registered classification or segmentation experiment."""
     experiment_id = datetime.now(timezone.utc).strftime("exp_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
@@ -260,6 +267,7 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         else:
             result["peak_gpu_memory_mb"] = None
         result[f"best_val_{data.primary_metric}"] = best_accuracy
+        result.update(_publish_model_version(result, experiment_dir))
         _json_write(experiment_dir / "result.json", result)
         return result
     except Exception as exc:
