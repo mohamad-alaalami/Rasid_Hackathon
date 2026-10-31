@@ -65,6 +65,40 @@ has real recorded diagnostics. Outputs are written to a new timestamped director
 under `artifacts/feedback_comparison/` as JSON, CSV, Markdown, and per-trial decision
 traces; previous campaign and comparison results are never overwritten.
 
+## Experiment-selection policies P0/P1
+
+`--policy` is independent of `--feedback`:
+
+- `P0` (default): free selection; the agent, prompt, and training tool are unchanged.
+- `P1`: evidence-grounded selection. `run_campaign_experiment` additionally requires a
+  `decision_record` with nonempty `observation`, `action`, `expected_signal`, and
+  `cost_justification`. Malformed records are rejected with `INVALID_DECISION_RECORD`
+  before reservation, so they never train or consume budget. The record never
+  overrides the deterministic model, batch, duplicate, and budget checks.
+
+```bash
+python -m agent.main --mode campaign --feedback E2 --policy P1 --dataset m-pv4ger --max-experiments 4
+```
+
+Every attempt (accepted, failed, or rejected) is appended to
+`artifacts/campaigns/decisions.jsonl` with its policy, campaign, configuration,
+decision record, and the previous/incumbent experiment at decision time. No agent
+tool reads that log, so P1 gets no extra observations. The final report joins it with
+the measured results into `decision_trace`, keeping Claude's `expected_signal` apart
+from the measured `validation_score`. A campaign ID cannot switch policies.
+
+Compare P0 and P1 under frozen common conditions (same E-profile, dataset, seed,
+forced first run, model registry, evaluator, and experiment budget; separate campaigns):
+
+```bash
+python -m agent.compare_policies --dataset m-pv4ger --feedback E2 --repeats 3 --max-experiments 4 --seed 42
+```
+
+Reports go to `artifacts/policy_comparison/<run_id>/`. They are descriptive: no winner
+is claimed, and one campaign per policy is not statistical evidence. Every run trains
+from the registry's pretrained weights, because checkpoint resumption is unsupported.
+GPU time is measured and reported but not enforced as a budget.
+
 Run the Phase-A one-batch GPU checks before adding model architectures:
 
 ```bash

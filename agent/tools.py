@@ -8,6 +8,14 @@ from strands import tool
 
 from agent.feedback import build_feedback
 from agent.campaign import CampaignRunner
+from agent.policies import (
+    DEFAULT_POLICY,
+    check_campaign_policy,
+    check_policy,
+    launch_with_decision,
+    record_rejection,
+    validate_decision_record,
+)
 from agent.experiments import (
     finalize_training,
     get_best_experiment,
@@ -666,8 +674,14 @@ def make_registered_training_tool(
     required_dataset: str | None = None,
     training_fn=run_training,
     attempt_log: list[dict] | None = None,
+    selection_policy: str = DEFAULT_POLICY,
 ):
-    """Create the only production tool that launches campaign GPU training."""
+    """Create the only production tool that launches campaign GPU training.
+
+    P0 exposes the original signature. P1 adds a required ``decision_record``
+    that is validated before any reservation; both share one CampaignRunner.
+    """
+    check_policy(selection_policy)
     runner = CampaignRunner(
         version=version,
         campaign_id=campaign_id,
@@ -678,27 +692,34 @@ def make_registered_training_tool(
         ),
     )
 
-    @tool
-    def run_campaign_experiment(
-        dataset_id: str,
-        model_id: str,
-        epochs: int,
-        batch_size: int,
-        learning_rate: float,
-        weight_decay: float = 0.0001,
-        pretrained: bool = True,
-        image_size: int | None = None,
-    ) -> dict:
-        """Run one real train/validation experiment within the campaign budget."""
+    def attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
+                weight_decay, pretrained, image_size, decision_record=None):
+        identity = {
+            "version": version,
+            "campaign_id": campaign_id,
+            "seed": seed,
+            "dataset_id": dataset_id,
+            "policy": selection_policy,
+            "configuration": None,
+            "decision_record": decision_record,
+            "origin": "agent",
+        }
+
+        def reject(response):
+            if attempt_log is not None:
+                attempt_log.append({
+                    "configuration": identity["configuration"],
+                    "decision_record": identity["decision_record"],
+                    "response": response,
+                })
+            return record_rejection(response, **identity)
+
         if required_dataset is not None and dataset_id != required_dataset:
-            response = {
+            return reject({
                 "status": "rejected",
                 "error_code": "DATASET_NOT_ALLOWED",
                 "message": f"This campaign is restricted to {required_dataset}.",
-            }
-            if attempt_log is not None:
-                attempt_log.append({"configuration": None, "response": response})
-            return response
+            })
         configuration = {
             "architecture": model_id,
             "learning_rate": learning_rate,
@@ -708,6 +729,15 @@ def make_registered_training_tool(
             "pretrained": pretrained,
             "image_size": image_size,
         }
+        identity["configuration"] = configuration
+        mismatch = check_campaign_policy(campaign_id, seed, selection_policy)
+        if mismatch:
+            return reject(mismatch)
+        if selection_policy == "P1":
+            normalized, error = validate_decision_record(decision_record)
+            if error:
+                return reject(error)
+            identity["decision_record"] = normalized
         try:
             if not 1 <= epochs <= 20:
                 raise ValueError("epochs must be between 1 and 20.")
@@ -727,19 +757,71 @@ def make_registered_training_tool(
                     f"batch_size exceeds limit {model_spec.conservative_batch_size}."
                 )
         except Exception as exc:
-            response = {
+            return reject({
                 "status": "rejected",
                 "error_code": "INVALID_MODEL_CONFIGURATION",
                 "message": str(exc),
-            }
-            if attempt_log is not None:
-                attempt_log.append({"configuration": configuration, "response": response})
-            return response
+            })
 
-        response = runner.run(dataset_id, configuration)
+        response = launch_with_decision(
+            lambda: runner.run(dataset_id, configuration), **identity
+        )
         if attempt_log is not None:
-            attempt_log.append({"configuration": configuration, "response": response})
+            attempt_log.append({
+                "configuration": configuration,
+                "decision_record": identity["decision_record"],
+                "response": response,
+            })
         return response
+
+    if selection_policy == "P0":
+        @tool
+        def run_campaign_experiment(
+            dataset_id: str,
+            model_id: str,
+            epochs: int,
+            batch_size: int,
+            learning_rate: float,
+            weight_decay: float = 0.0001,
+            pretrained: bool = True,
+            image_size: int | None = None,
+        ) -> dict:
+            """Run one real train/validation experiment within the campaign budget."""
+            return attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
+                           weight_decay, pretrained, image_size)
+
+        return run_campaign_experiment
+
+    @tool
+    def run_campaign_experiment(
+        decision_record: dict,
+        dataset_id: str,
+        model_id: str,
+        epochs: int,
+        batch_size: int,
+        learning_rate: float,
+        weight_decay: float = 0.0001,
+        pretrained: bool = True,
+        image_size: int | None = None,
+    ) -> dict:
+        """Run one real train/validation experiment within the campaign budget.
+
+        Args:
+            decision_record: Required object with nonempty string fields
+                observation, action, expected_signal, and cost_justification.
+                Malformed records are rejected before any training or budget use.
+            dataset_id: Registered dataset to train on.
+            model_id: Eligible model from list_eligible_models.
+            epochs: Training epochs, 1 to 20. Each run starts from pretrained
+                weights; checkpoint resumption is not supported.
+            batch_size: Positive batch size within the model limit.
+            learning_rate: Positive learning rate.
+            weight_decay: Nonnegative weight decay.
+            pretrained: Use the registry's verified pretrained weights.
+            image_size: Optional square resize; native resolution when omitted.
+        """
+        return attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
+                       weight_decay, pretrained, image_size, decision_record)
 
     return run_campaign_experiment
 

@@ -9,6 +9,7 @@ from strands import Agent
 from strands.models import BedrockModel
 
 from agent.experiments import create_campaign_id, get_best_experiment, load_campaign_experiments
+from agent.policies import SELECTION_POLICIES, build_decision_trace, build_system_prompt
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import (
     agent_capabilities,
@@ -41,6 +42,7 @@ def create_campaign_agent(args, campaign_id: str) -> Agent:
             seed=args.seed,
             max_experiments=args.max_experiments,
             required_dataset=args.dataset,
+            selection_policy=args.policy,
         ),
         make_campaign_report_tool(args.feedback, campaign_id, args.seed),
     ]
@@ -50,7 +52,7 @@ def create_campaign_agent(args, campaign_id: str) -> Agent:
         tools.append(make_campaign_diagnostics_tool(args.feedback, campaign_id, args.seed))
     return Agent(
         model=_bedrock_model(args.model_id, args.region),
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=build_system_prompt(args.policy),
         tools=tools,
     )
 
@@ -82,7 +84,10 @@ recorded as failed and is not evidence of model quality.
 
 def run_campaign(args) -> str:
     campaign_id = args.campaign_id or create_campaign_id()
-    print(json.dumps({"mode": "campaign", "campaign_id": campaign_id}, indent=2))
+    print(json.dumps(
+        {"mode": "campaign", "campaign_id": campaign_id, "selection_policy": args.policy},
+        indent=2,
+    ))
     create_campaign_agent(args, campaign_id)(campaign_prompt(args, campaign_id))
     records = load_campaign_experiments(args.feedback, campaign_id, args.seed)
     datasets = sorted({record["dataset"] for record in records})
@@ -93,11 +98,13 @@ def run_campaign(args) -> str:
     report = {
         "campaign_id": campaign_id,
         "feedback_version": args.feedback,
+        "selection_policy": args.policy,
         "dataset_id": datasets[0] if len(datasets) == 1 else None,
         "experiments": records,
         "best_experiment_id": best.get("experiment_id") if best else None,
         "best_validation_score": best.get("validation_score") if best else None,
         "best_checkpoint_path": best.get("checkpoint_path") if best else None,
+        "decision_trace": build_decision_trace(args.feedback, campaign_id, args.seed),
     }
     print("\nFINAL PERSISTED CAMPAIGN REPORT")
     print(json.dumps(report, indent=2))
@@ -125,6 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GoTrain real autonomous ML agent")
     parser.add_argument("--mode", choices=("campaign", "smoke"), default="campaign")
     parser.add_argument("--feedback", choices=("E0", "E1", "E2", "E3"), default="E3")
+    parser.add_argument(
+        "--policy", choices=SELECTION_POLICIES, default="P0",
+        help="Experiment selection: P0 free, P1 evidence-grounded decision records.",
+    )
     parser.add_argument("--max-experiments", type=int, default=5)
     parser.add_argument("--campaign-id", help="Resume an existing campaign ID.")
     parser.add_argument("--dataset", help="Optional registered dataset restriction.")
