@@ -1,418 +1,174 @@
 # GoTrain
 
-GoTrain is a Strands/Claude agent backed by a registry-driven GEO-Bench training engine.
-The same `ml.train_model` API powers terminal runs and agent tool calls.
+**An autonomous, configurable ML experimentation agent for geospatial imagery.**  
+*AUB ACM × RASID GoTrain Challenge · November 2026*
 
-Registered datasets:
+GoTrain uses **Strands Agents**, **Claude Sonnet on Amazon Bedrock**, and **GPU training on Amazon SageMaker** to inspect GEO-Bench datasets, select compatible models and training pipelines, train them, evaluate on validation data, and iteratively propose the next experiment.
 
-- `m-eurosat`: 10-class classification; 13 bands available, verified RGB baseline selected
-- `m-pv4ger`: binary aerial-RGB classification
-- `m-pv4ger-seg`: binary aerial-RGB segmentation
-- `m-chesapeake`: 7-class aerial RGB+NIR segmentation
-- `m-forestnet`: 12-class classification; Landsat-8 Red, Green, Blue, NIR, SWIR1, SWIR2 (uint8, 332x332)
-- `m-brick-kiln`: binary classification; 13 stored channels (64x64)
-- `m-nz-cattle`: binary aerial-RGB segmentation (500x500)
-- `m-cashew-plant`: 7-class segmentation; 12 Sentinel-2 bands plus cloud probability (256x256)
+## Why we built it this way
 
-Channels are always selected by verified physical index, never by GEO-Bench's
-stored band names. Per [geo-bench #29 / PR #30](https://github.com/ServiceNow/geo-bench/pull/30),
-`m-brick-kiln` stores `B01 B02 B03 B04 B05 B07 B8A B08 B11 B12 TCI_R TCI_G TCI_B`
-(no B06/B09/B10; the TCI channels are 8-bit true-colour composites) although its
-metadata claims the 13 standard Sentinel-2 bands; `m-eurosat` stores B8A last (#28),
-which the existing SSL4EO reorder already assumed. Each dataset offers explicit input
-views (`rgb`, `multispectral`, `sentinel2_13`, `dataset_channels`); excluded channels
-(brick-kiln TCI in the multispectral view, cashew cloud probability) are documented in
-`ml/registry.py` and recorded in every checkpoint. The four new datasets are
-standardized per channel with statistics from up to 256 evenly spaced training
-samples; the statistics are stored in the checkpoint and reused for final test
-evaluation. The original four datasets keep their fixed scaling and ImageNet
-normalization.
+Our first working agent established the core loop surprisingly quickly, achieving approximately **97% validation accuracy** on a classification problem. We could have spent the rest of the hackathon tuning for another fraction of a percentage point. Instead, we focused on a more difficult engineering question:
 
-To add another compatible GEO-Bench classification or semantic-segmentation dataset,
-add its verified contract to `ml/registry.py`. The loader, model factory, trainer,
-evaluator, command line, and agent tools then select their behavior dynamically.
+> **How do we make an autonomous ML engineer configurable, accountable, resource-aware, and reusable across datasets?**
 
-Run a real autonomous E3 campaign on SageMaker:
+We spent much of the hackathon developing independent controls over what Claude observes, how decisions are recorded, what it may change, and when it needs approval. We then added persistent experimental memory, branching search, compute budgeting, checkpoint continuation, artifact versioning, and an independent evidence verifier.
 
-```bash
-python -m agent.main --mode campaign --feedback E3 --max-experiments 5
-```
+That choice left less time for comprehensive end-of-hackathon benchmarking. This repository distinguishes **implemented functionality**, **measured validation results**, and **remaining evaluation work** rather than filling missing results with guesses.
 
-Claude inspects the GPU and registry, selects one dataset, discovers eligible
-models, and launches only real `ml.train_model()` experiments. Campaign records
-are persisted under `artifacts/campaigns/`. Supply `--campaign-id ID` to resume,
-or `--dataset m-pv4ger` to restrict dataset selection.
-
-Run an explicitly bounded one-run debugging smoke test:
-
-```bash
-python -m ml.inspect_dataset --dataset-id m-eurosat
-python -m ml.run_experiment --dataset-id m-eurosat --config configs/baseline.json
-python -m agent.main --mode smoke --dataset m-eurosat --model resnet18_rgb
-```
-
-There is no simulated feedback probe. E0-E3 observations are constructed only
-from persisted real train/validation experiment artifacts. Missing diagnostics
-are reported as unavailable and failures are saved as failures.
-
-## Controlled E0-E3 comparison
-
-Run a small real SageMaker pilot (four isolated campaigns, three experiments each):
-
-```bash
-python -m agent.compare_feedback \
-  --dataset m-pv4ger \
-  --repeats 1 \
-  --max-experiments 3 \
-  --seed 42
-```
-
-Run a larger matched-seed comparison:
-
-```bash
-python -m agent.compare_feedback \
-  --dataset m-pv4ger \
-  --repeats 3 \
-  --max-experiments 3 \
-  --seed 42
-```
-
-Every mode receives the same forced first real configuration for a given seed.
-E0/E1 have no history tool, E2 has isolated campaign history, and E3 additionally
-has real recorded diagnostics. Outputs are written to a new timestamped directory
-under `artifacts/feedback_comparison/` as JSON, CSV, Markdown, and per-trial decision
-traces; previous campaign and comparison results are never overwritten.
-
-## Experiment-selection policies P0/P1
-
-`--policy` is independent of `--feedback`:
-
-- `P0` (default): free selection; the agent, prompt, and training tool are unchanged.
-- `P1`: evidence-grounded selection. `run_campaign_experiment` additionally requires a
-  `decision_record` with nonempty `observation`, `action`, `expected_signal`, and
-  `cost_justification`. Malformed records are rejected with `INVALID_DECISION_RECORD`
-  before reservation, so they never train or consume budget. The record never
-  overrides the deterministic model, batch, duplicate, and budget checks.
-
-```bash
-python -m agent.main --mode campaign --feedback E2 --policy P1 --dataset m-pv4ger --max-experiments 4
-```
-
-Every attempt (accepted, failed, or rejected) is appended to
-`artifacts/campaigns/decisions.jsonl` with its policy, campaign, configuration,
-decision record, and the previous/incumbent experiment at decision time. No agent
-tool reads that log, so P1 gets no extra observations. The final report joins it with
-the measured results into `decision_trace`, keeping Claude's `expected_signal` apart
-from the measured `validation_score`. A campaign ID cannot switch policies.
-
-Compare P0 and P1 under frozen common conditions (same E-profile, dataset, seed,
-forced first run, model registry, evaluator, and experiment budget; separate campaigns):
-
-```bash
-python -m agent.compare_policies --dataset m-pv4ger --feedback E2 --repeats 3 --max-experiments 4 --seed 42
-```
-
-Reports go to `artifacts/policy_comparison/<run_id>/`. They are descriptive: no winner
-is claimed, and one campaign per policy is not statistical evidence. Every run trains
-from the registry's pretrained weights, because checkpoint resumption is unsupported.
-GPU time is measured and reported but not enforced as a budget.
-
-## Resource accounting
-
-Every `agent.main` campaign (and `agent.compare_policies` trial) records one session per
-agent process in `artifacts/campaigns/resources.jsonl`: provider-reported Bedrock tokens,
-model invocations (Strands event-loop cycles), LLM latency, and elapsed time. Training
-time is read from the existing experiment records (`training_seconds`, else
-`runtime_seconds`; never both). Values that were not reported are `unknown`, never zero.
-Costs need an explicit price file; copy `configs/prices.example.json` and fill it in.
-
-```bash
-python -m research.resource_accounting --campaign-id ID --prices configs/prices.json
-python -m research.resource_accounting --campaign-id ID --json
-```
-
-## Composable pipelines, solutions, and autonomy
-
-`ml/components.py` defines every supported training component with its parameters and
-compatibility constraints: input view and normalization, spatial augmentations
-(`hflip`, `vflip`, `rot90`, `random_resized_crop`; masks move with images), photometric
-augmentations (`brightness`, `contrast`, `gaussian_noise`; one shared factor across all
-channels, so band relationships are preserved), losses (`cross_entropy` with label
-smoothing, `focal`, segmentation-only `dice_cross_entropy`, optional inverse-frequency
-class weights), optimizers (`adamw`, `sgd`), schedulers (`cosine`, `constant`, `step`,
-`warmup_cosine`), and classification-head `dropout`. A `pipeline` object in the training
-config selects them; omitted keys keep the historical defaults (flips, cross-entropy,
-AdamW, cosine), so existing campaigns are unchanged. Incompatible combinations are
-rejected with every reason listed.
-
-```bash
-python -m ml.smoke_test --dataset-id m-cashew-plant --model unet_r34 \
-  --pipeline '{"loss": {"name": "dice_cross_entropy", "class_weighting": "inverse_frequency"}, "augmentations": [{"name": "rot90"}, {"name": "hflip"}]}'
-```
-
-Every training run is recorded against an immutable, content-addressed `SolutionSpec`
-under `artifacts/solutions/<solution_id>/` (`$GOTRAIN_SOLUTIONS_DIR` overrides):
-`spec.json` (dataset contract hash, input channels, normalization policy, model and
-pretrained provenance, pipeline, training settings, seed) and an append-only
-`events.jsonl` with proposals (parent solution, change description, campaign, autonomy)
-and executions (validation results, resources, checkpoint SHA-256, environment, dataset
-fingerprint). `custom_components` binds generated code (scope S2, below) by component ID and
-source SHA-256; it is `[]` for every other pipeline, so Phase 1A solution IDs are unchanged.
-`initialization` is reserved for later warm starts.
-
-Autonomy has two independent axes, separate from P0/P1 and HITL:
-`--authority A2` (default: Claude chooses and launches) or `A1` (launches must first be
-proposed with `propose_solution`), and `--scope S0` (default: existing knobs) or `S1`
-(compose pipeline components via `list_pipeline_components`, a `pipeline` argument,
-`parent_solution_id`/`change_description`, and `inspect_solutions`), or `S2` (S1 plus
-sandboxed generated custom losses; see below). A0 (system decisions) is reserved.
-
-```bash
-python -m agent.main --dataset m-forestnet --feedback E2 --scope S1 --max-experiments 3
-```
-
-## Generated custom losses (scope S2, Phase 1B)
-
-With `--scope S2`, Claude can invent a loss that is not in the catalog: it calls
-`describe_custom_loss_contract`, writes Python source, and submits it with
-`submit_custom_loss`. The code is archived, statically checked, and **executed only inside an
-isolated sandbox** against synthetic data; the structured reply lists every failed check so
-Claude can revise. Only accepted components can be used, via
-`pipeline={"loss": {"name": "custom", "component_id": "cl_..."}}`. S0/S1 reject generated
-components with `SCOPE_NOT_PERMITTED` before any validation or budget use.
-
-Contract `gotrain.custom_loss/1` (`ml/custom_components.py`):
-`compute_loss(logits, targets, *, task, class_weights=None, ignore_index=None, **params)`
-returns a 0-dim tensor differentiable in `logits` (`[N,C]` or `[N,C,H,W]`, float32; targets
-int64). Imports are limited to `torch`, `torch.nn`, `torch.nn.functional`, `math`, `typing`.
-Validation (host-generated inputs, host-computed checks; classification and/or
-segmentation, class weights, ignored targets, batch of one): executes, finite loss and
-gradient, gradient shape, gradient flows to counted targets, **zero gradient at ignored
-targets**, deterministic under a fixed seed, lower loss for correct than random predictions,
-per-call time limit. The sealed test split and real datasets are never used.
-
-Execution architecture (`ml/sandbox.py`, `ml/sandbox_worker.py`): the trainer never imports
-generated code. A `SandboxedLoss` sends logits/labels as raw bytes to a worker and applies the
-gradient it returns (the host never unpickles sandbox output). The worker runs in fresh
-user/mount/net/PID/IPC/UTS namespaces built with util-linux (`unshare`, `pivot_root`,
-`setpriv`, `prlimit`): a tmpfs root with only read-only system libraries, the Python
-environment, `ld.so.cache`, four `/dev` nodes, a 64 MB `/tmp`, read-only `/proc`, and a
-read-only `/work`; no network; empty capability sets and `no_new_privs`; a seccomp filter
-(fork/vfork/non-thread clone, exec, sockets, io_uring, x32 ABI, mount/namespace/ptrace/bpf/
-keyring/module syscalls); RLIMIT_AS (4 GB default), CPU, file size and open-file limits;
-per-request wall-clock timeouts that kill the whole process tree. If the host process is
-root, the sandbox starts as uid 65534 so its namespace-root never maps to host root.
-Before any generated code runs, a trusted probe attempts every escape from inside the
-sandbox; if any succeeds, or the runtime cannot be built (non-Linux, user namespaces
-disabled, missing tools), **execution is refused** (`isolation_unavailable`) — there is no
-fallback. Generated losses only produce the training signal: metrics, splits, checkpoint
-selection and verification, resource accounting and trainer safety controls stay in
-trusted code.
-
-Provenance: components are content-addressed under `artifacts/custom_components/<id>/`
-(`source.py`, `component.json`, append-only `validations.jsonl`); tampering is detected by
-re-hashing. Training re-validates the component in its own sandbox before the first batch
-(so a forged "accepted" record cannot train), copies the exact source into
-`<experiment>/custom_components/`, and records it in the checkpoint, `result.json`, the run
-event and the `SolutionSpec`. Checkpoints reload without the sandbox (the sealed evaluator
-uses its own cross-entropy). Under `--hitl critical`, every launch with a generated
-component triggers a `code_change` consultation that shows the human the exact source and
-needs an approval naming that component; A1 still requires `propose_solution` first.
-
-```bash
-python -m ml.sandbox                                   # verify the isolation runtime (exit 0 = usable)
-python -m ml.custom_components submit loss.py --tasks segmentation --params '{"alpha": 0.3}'
-python -m ml.custom_components list
-python -m ml.custom_components show cl_...
-```
-
-Known limitations (not claimed as guaranteed):
-- Linux-only, and it depends on unprivileged user namespaces; Windows/macOS and most
-  Docker containers with the default seccomp profile (e.g. SageMaker *training jobs*)
-  refuse execution. It is not a VM: a kernel vulnerability reachable through the allowed
-  syscalls (file I/O, mmap, futex, threads) would break it.
-- Read-only exposure: system libraries under `/usr/lib`, `/lib*`, and the Python
-  environment (including other installed packages) are readable; if that environment lives
-  under `$HOME`, listing `$HOME` reveals its directory name. Nothing writable is shared.
-- Resource limits are per worker: RLIMIT_AS, not a cgroup memory limit; CPU is bounded by
-  RLIMIT_CPU and request timeouts, not a cgroup quota; threads (up to `RLIMIT_NPROC`) are allowed.
-- The loss value reported as `val_loss` comes from the generated code; validation metrics do not.
-- Every loss call crosses a process boundary (CPU copy of logits and gradient), which slows
-  training, especially for large segmentation batches.
-
-### SageMaker verification
-
-Run from the repository root on the notebook instance (no Bedrock calls in steps 1-2):
-
-```bash
-# 1. CPU-only isolation tests (no GPU, no dataset, no AWS calls)
-python -m ml.sandbox
-CUDA_VISIBLE_DEVICES="" python -m pytest -q tests/test_custom_components.py tests/test_sandbox_linux.py
-python -m pytest -q tests/
-
-# 2. One-batch GPU checks on real data with the two generated demo losses
-python -c "import sys; sys.path.insert(0, 'tests'); import generated_losses as g; open('/tmp/poly1.py', 'w').write(g.POLY1); open('/tmp/tversky.py', 'w').write(g.TVERSKY)"
-python -m ml.custom_components submit /tmp/poly1.py --tasks classification segmentation --params '{"epsilon": 1.0}' --name poly1      # cl_e4f04209a6f106d91b2d
-python -m ml.custom_components submit /tmp/tversky.py --tasks segmentation --params '{"alpha": 0.3, "beta": 0.7, "mix": 0.5}' --name tversky  # cl_c2aef2f77f6a85970a68
-python -m ml.smoke_test --dataset-id m-eurosat --model resnet18_rgb --pipeline '{"loss": {"name": "custom", "component_id": "cl_e4f04209a6f106d91b2d"}}'
-python -m ml.smoke_test --dataset-id m-cashew-plant --model unet_r34 --pipeline '{"loss": {"name": "custom", "component_id": "cl_c2aef2f77f6a85970a68", "class_weighting": "inverse_frequency"}}'
-python -m pytest -q tests/test_sandbox_linux.py -k cuda
-
-# 3. Optional, paid (Bedrock + GPU): Claude writes, validates, and trains its own loss
-python -m agent.main --mode campaign --dataset m-cashew-plant --feedback E3 --scope S2 --max-experiments 3
-python -m agent.main --mode campaign --dataset m-cashew-plant --feedback E3 --scope S2 --authority A1 --hitl critical --max-experiments 3
-```
-
-## Human-in-the-loop (`--hitl`)
-
-- `off` (default): fully autonomous; agent, prompt, and tools are unchanged.
-- `always`: before every training run Claude calls `request_human_consultation` with the
-  evidence, options (with exact configurations and measured-cost estimates), and its
-  recommendation. The human picks an option, delegates back to Claude, or stops.
-- `critical`: autonomous, but approval is required after `--hitl-failure-threshold`
-  consecutive failed runs, or when a run's measured-cost estimate exceeds
-  `--hitl-cost-threshold-usd`. Claude must consult before proposing code changes and may
-  consult when evidence is insufficient.
-
-With a cost threshold, a run whose cost cannot be estimated from measured runs of the
-same model asks the human by default (`--hitl-unknown-cost allow` opts out).
-
-The training tool checks approval before reservation, so blocked launches use no budget.
-A selected configuration must be launched exactly. A consultation raises a Strands
-interrupt: the agent loop stops (HITL agents run tools sequentially), the conversation
-and interrupt are saved by Strands' `FileSessionManager`, and no training job is running.
-By default the process exits; the human answers by request number and the campaign
-resumes once. `--hitl-interactive` instead asks on the terminal between agent calls.
-
-```bash
-python -m agent.main --hitl always --dataset m-pv4ger --feedback E2 --max-experiments 4 --campaign-id demo1
-python -m agent.hitl show --campaign-id demo1
-python -m agent.hitl respond --campaign-id demo1 --request-id 1 --choice A --note "keep native resolution"
-python -m agent.main --resume --campaign-id demo1
-python -m agent.main --hitl critical --dataset m-chesapeake --hitl-cost-threshold-usd 2 --prices configs/prices.json
-python -m agent.main --hitl always --hitl-interactive --dataset m-pv4ger
-```
-
-Run the Phase-A one-batch GPU checks before adding model architectures:
-
-```bash
-python -m ml.smoke_test --dataset-id m-pv4ger --model resnet18_rgb
-python -m ml.smoke_test --dataset-id m-pv4ger-seg --model fcn_resnet50
-python -m ml.smoke_test --dataset-id m-chesapeake --model fcn_resnet50
-```
-
-Smoke tests and training preserve each dataset's verified native resolution by
-default: EuroSAT 64x64, PV4GER/PV4GER-Seg 320x320, and Chesapeake 256x256.
-Use `--image-size N` only as an explicit square resize experiment (for example,
-after a native-resolution GPU out-of-memory result); the image uses bilinear
-interpolation and segmentation masks use nearest-neighbor interpolation.
-
-Training uses only `train` and `valid`. The test split is reserved for one final evaluation.
-
-## Validation-based early stopping
-
-Early stopping is optional and disabled by default so existing baselines remain
-unchanged. Enable it in any training configuration or agent tool call:
-
-```json
-{
-  "epochs": 15,
-  "early_stopping": true,
-  "early_stopping_patience": 3,
-  "early_stopping_min_delta": 0.001
-}
-```
-
-`epochs` is then the maximum. Training stops after the primary validation metric
-(accuracy for classification or IoU for segmentation) fails to improve by more
-than `early_stopping_min_delta` for `early_stopping_patience` consecutive epochs.
-The best real checkpoint is preserved. Results record requested/completed epochs,
-whether stopping occurred, and the factual stop reason.
-
-## Model selection
-
-`ml/model_registry.py` is the factual source for model compatibility and provenance.
-Claude must call `list_eligible_models(dataset_id)` and may select only entries whose
-runtime `eligible` value is true. Missing packages or exact checkpoints are reported;
-the engine never substitutes random weights.
-
-Target configurations:
-
-- `resnet18_rgb`: TorchVision `ResNet18_Weights.IMAGENET1K_V1`
-- `convnext_tiny_rgb`: TorchVision `ConvNeXt_Tiny_Weights.IMAGENET1K_V1`
-- `resnet18_s2`: SSL4EO-S12 `B13_rn18_moco_0099_ckpt.pth`
-- `resnet50_s2`: SSL4EO-S12 `B13_rn50_dino_0099.pth`
-- `unet_r34`: SMP U-Net with pinned ResNet-34 ImageNet encoder provenance
-- `deeplabv3plus_r50`: SMP DeepLabV3+ with pinned ResNet-50 ImageNet encoder provenance
-- `resnet18_ms`, `resnet50_ms`: TorchVision ImageNet ResNets for multispectral views
-
-Compatibility is a capability rule, not a dataset list: a model is offered when its
-task type matches and the dataset declares the input view it consumes. When a model
-takes more than three channels, its pretrained RGB filters are placed on the channels
-verified as red/green/blue and every other channel starts from the mean pretrained RGB
-filter (documented adaptation, never random). U-Net and DeepLabV3+ pad inputs to a
-multiple of 32 and crop outputs back, so `m-nz-cattle` trains at native 500x500.
-
-The existing `fcn_resnet50` implementation is retained as a legacy segmentation
-baseline but is not presented as one of the requested target configurations.
-
-Run every currently eligible combination on SageMaker:
-
-```bash
-python -m ml.smoke_matrix --include-legacy
-```
-
-The command saves factual runtime and peak-memory results to
-`artifacts/smoke_matrix.json`. Models with missing dependencies or checkpoints are
-recorded as skipped, not silently initialized.
-
-## Dataset and model-version store
-
-GoTrain can keep datasets, trained model versions, and agent logs in Amazon S3
-(or any shared directory) instead of only the notebook folder. It is disabled
-unless `GOTRAIN_STORE` is set; without it, training, tools, and prompts are unchanged.
-
-```bash
-export GOTRAIN_STORE=s3://<bucket>/gotrain   # or a directory such as ~/gotrain-store
-python -m storage doctor                     # checks access; suggests the SageMaker default bucket
-```
-
-When enabled:
-
-- Every completed training run is uploaded automatically as the next numbered
-  version of its dataset (`m-eurosat/v0003`): checkpoint, config, metrics, and a
-  provenance record with the validation score, experiment ID, and git commit.
-  Upload problems are reported in the result and never fail a finished run.
-- Campaign agents get `model_store_status`, `sync_dataset` (download a dataset
-  if this instance lacks it, upload it if the store lacks it) and
-  `upload_experiment`. E2/E3 campaigns also get `list_model_versions`,
-  `get_model_version`, `promote_model_version`, and `download_model_version`;
-  E0/E1 do not, because version history would break their no-history contract.
-  The controlled comparison runners never receive store tools.
-
-Store layout:
+## The experimentation loop
 
 ```text
-datasets/<benchmark>/<dataset>.tar (+ .manifest.json with SHA-256)
-models/<dataset>/v0001/{version.json, best.pt, config.json, metrics.json, training_result.json}
-models/<dataset>/champion.json          current champion + promotion history
-models/<dataset>/test_evaluation.json   the one-time final test result
-logs/{artifacts,experiments}/...        campaign logs and experiment records
+GEO-Bench dataset + user constraints
+             ↓
+Inspect task, channels, classes, candidate models, and resources
+             ↓
+Claude observes evidence → proposes a model/pipeline and experiment
+             ↓
+Policy + authority + scope + HITL guards
+             ↓
+Train on SageMaker GPU → evaluate on VALIDATION split
+             ↓
+Record metrics, checkpoints, provenance, and resource consumption
+             ↓
+Independent evidence verification (when enabled)
+             ↓
+Search memory → refine, branch, continue, revisit, or stop
 ```
 
-Human commands (`python -m storage <command>`):
+The **test split is not available to the autonomous experimentation loop**. Final test evaluation is a separate, human-authorized, one-time operation for the selected champion of each dataset.
+
+## Configurable operating modes
+
+| Control | Purpose | Choices |
+|---|---|---|
+| **Feedback (E)** | What evidence Claude receives | `E0`–`E3`, from minimal feedback to richer diagnostics/history |
+| **Decision policy (P)** | How Claude records its rationale | `P0`: direct proposal; `P1`: structured evidence, hypothesis, expected signal, and cost justification |
+| **Authority (A)** | Which decisions can proceed autonomously | `A1`: proposal/authorization stage; `A2`: bounded autonomous execution; `A0`: reserved, **not implemented** |
+| **Scope (S)** | What components Claude may change | `S0`: standard configuration/model choices; `S1`: compositional pipeline changes; `S2`: sandboxed generated components, where supported |
+| **HITL** | When human oversight is required | `off`, `critical`, `always` |
+
+These dimensions are **not a single quality ranking**. More information, autonomy, or editable scope may increase cost and risk. For example, `P1 + A2` allows structured explanations while the agent executes permitted experiments autonomously.
+
+**Deployment limitation:** `S2` sandboxed Python execution requires capabilities unavailable in the current SageMaker environment (`unshare` is blocked). It fails closed there; do not interpret this as a successful SageMaker S2 deployment.
+
+## Search, compute, and persistence
+
+**Experiment search graph.** Candidate solutions have persistent identities and parent relationships. Claude can explore alternative branches, refine earlier candidates, and avoid duplicate configurations instead of treating every experiment as a single linear chain. A parent link describes design lineage, **not necessarily reuse of trained weights**.
+
+**Adaptive compute.** The agent can allocate training effort within an experiment budget; continuation support can restore saved optimizer, scheduler, scaler, and random-state information instead of treating every additional training action as a fresh model. The capability is implemented and tested, but individual campaign logs must be inspected to establish whether an *agent-selected continuation* actually occurred.
+
+**Experimental memory.** The search history preserves candidate configurations, parent-child relations, decisions, observations, outcomes, and resource use so later experiments can use the context of earlier work.
+
+**Artifact store.** Local/S3-compatible storage versions training outputs and tracks champions, checkpoint integrity, metrics, provenance, and campaign logs. A model version is an immutable record; a champion is the version selected for final evaluation.
+
+## Independent evidence verification
+
+The verifier is **deterministic and separate from Claude**. It uses saved experiment evidence rather than asking an LLM to judge its own hypotheses. It can:
+
+- Recompute validation diagnostics (classification: macro-F1, balanced accuracy, per-class results and calibration; segmentation: IoU/Dice and class diagnostics).
+- Compare *actual* parent/child configuration differences with the prediction recorded by the agent, and flag confounding from simultaneous changes.
+- Classify measurable hypotheses as `SUPPORTED`, `CONTRADICTED`, `INCONCLUSIVE`, or `NOT_TESTABLE`.
+- Assess uncertainty when sufficient paired or matched-seed data exist; explicitly report insufficient evidence otherwise.
+- Track validation reuse, GPU/time/token costs, checkpoint integrity, and score-versus-compute tradeoffs.
+
+This verifier does **not prove causal explanations**, replace GEO-Bench's primary metric, select the final model on the test set, or magically make small observed differences statistically meaningful.
+
+**Verification status:** Implementation passed a local automated test suite (270 passed, 13 skipped in the development report). Its real-artifact integration on SageMaker was **not yet confirmed** in the evidence available for this README. The verifier's read-only agent tools are opt-in.
+
+## Results: measured validation, not final test
+
+The hackathon requires two classification and two segmentation tasks. The following are **best recorded validation metrics** from the available model registry / campaign records; they are **not official final-test scores**.
+
+| Required GEO-Bench problem | Task | Primary metric | Best recorded validation | Confirmed final test |
+|---|---|---|---:|---|
+| `m-eurosat` | 10-class land-cover classification | Accuracy | **97.90%** | **Not available** |
+| `m-pv4ger` | Solar panel classification | Accuracy | **97.90%** (97.8979%, rounded) | **Not available** |
+| `m-pv4ger-seg` | Solar panel segmentation | Mean IoU | **95.30%** | **Not available** |
+| `m-chesapeake` | 7-class land-cover segmentation | Mean IoU | **69.60%** | **Not available** |
+
+**Do not compare the numeric magnitudes across different datasets or metrics.** In particular, 69.60% mean IoU cannot be judged against 97.90% classification accuracy as though the tasks had the same difficulty.
+
+### Example: real EuroSAT autonomous campaign
+
+A sequential `E2 / P0` campaign completed six GPU experiments:
+
+| Experiment | Change | Best validation accuracy |
+|---|---|---:|
+| 1 | ResNet-18 baseline | 57.8% |
+| 2 | Switch to ConvNeXt-Tiny | 96.8% |
+| 3 | Increase input resolution to 128×128 | 97.2% |
+| 4 | Augmentation + label smoothing | 97.5% |
+| 5 | Increase resolution to 224×224 | **97.9%** |
+| 6 | Attempt longer schedule | 97.7% |
+
+The selected model was **experiment 5**, stored as **`m-eurosat/v0017`** (ConvNeXt-Tiny). This campaign recorded **2,941.19 seconds of GPU training** and **389,243 LLM tokens**. One attempted tool action was rejected because it referenced an invalid parent solution; the agent corrected the reference and completed the experiment.
+
+A separate graph-search/adaptive-compute EuroSAT campaign achieved **97.5%** best validation accuracy with approximately **584 seconds** of GPU training. This is an *illustrative quality/compute tradeoff*, **not a controlled head-to-head demonstration**: the campaigns did not have identical GPU budgets. The adaptive campaign completed six initial training actions; do not claim it demonstrated an autonomously chosen resume.
+
+### Decision policy evaluation
+
+A three-seed PV4GER `P0` versus `P1` comparison recorded mean best validation accuracy of approximately **97.47%** and **97.50%**, respectively. This tiny descriptive difference **does not establish that P1 is superior**; compute and the experimental trajectories were not perfectly matched. P1's independently valuable feature is decision traceability.
+
+### Final-test status
+
+The latest available storage summary showed the selected EuroSAT champion as `m-eurosat/v0017`, with test status **`in_progress` and no test score**. The final evaluator may have been interrupted. This is **not a confirmed result**. Do not reset or rerun the one-time evaluator without inspecting its lock/recovery procedure. At that point, the other required tasks also had no verified final-test scores, and `m-pv4ger-seg` had no promoted champion.
+
+## Running GoTrain
+
+The project was developed for the RASID-provided **SageMaker environment**, with Bedrock model access configured there. Install dependencies from the repository's environment/requirements configuration and configure the GEO-Bench dataset location before running training.
+
+Inspect the current CLI flags and guardrails:
 
 ```bash
-python -m storage push-dataset m-eurosat          # pull-dataset on another instance
-python -m storage register --all                  # version experiments trained before the store
-python -m storage versions m-eurosat
-python -m storage promote m-eurosat 3 --reason "best validation accuracy"
-python -m storage final-test m-eurosat --yes      # champion only, once per dataset
-python -m storage summary                         # champion, validation and test score per dataset
-python -m storage push-logs
+python -m agent.main --help
+python -m storage --help
 ```
 
-`final-test` is the only path to the test split. It evaluates the champion with
-the exact preprocessing stored in its checkpoint, records the result, and locks the
-dataset: a second test evaluation or a later promotion is refused. If a run crashes
-before reporting metrics, retry with `--retry-unfinished`.
+Example: a bounded autonomous EuroSAT search campaign:
+
+```bash
+python -m agent.main \
+  --search --adaptive-compute \
+  --feedback E2 --scope S1 --authority A2 \
+  --dataset m-eurosat \
+  --max-experiments 6 --max-training-seconds 1800
+```
+
+**Model registry / storage:**
+
+```bash
+python -m storage summary
+python -m storage versions m-eurosat
+python -m storage promote --help
+```
+
+**Independent verifier (after its code is integrated in the environment):**
+
+```bash
+python -m pytest -q tests/test_verification.py
+python -m verification list --dataset m-forestnet
+python -m verification campaign --campaign-id <CAMPAIGN_ID> --feedback E2 --seed 42 --out artifacts/verification_reports
+```
+
+**Human-authorized final test — only after freezing the champion and checking any existing evaluation status:**
+
+```bash
+python -m storage final-test m-eurosat --yes
+```
+
+This command is shown for documentation **only**. It evaluates the registered champion **once per dataset**; it must not be run to choose between competing candidates. For EuroSAT, an `in_progress` marker was already observed, so investigate that state before any further final-test action.
+
+## Evidence and reproducibility
+
+Every credible result should be traceable to its **dataset and split**, model/version, configuration, random seed, primary metric, checkpoint/hash, campaign log, source revision, and measured compute consumption. Local and S3 storage support preserving these records, but availability depends on the configured environment and whether artifacts were actually uploaded.
+
+The source tree contains an agent interface, training/dataset adapters, experiment search and resource accounting, storage commands, and the optional verification subsystem. Refer to the repository itself for the exact file inventory and version-specific usage.
+
+## What remains to validate
+
+- Resolve EuroSAT's existing final-test `in_progress` state safely and report an actual score only if produced by the protected evaluator.
+- Freeze and evaluate the selected champions **once** for the remaining required tasks, especially promoting a segmentation champion before attempting final evaluation.
+- Run the independent verifier against real persisted SageMaker campaign artifacts and publish those evidence reports.
+- Conduct matched-budget, multi-seed comparisons before claiming that one E/P/A/S combination or search strategy is objectively better.
+
+**The project's central choice:** We prioritized a configurable foundation for autonomous experimentation over squeezing marginal improvements from a single benchmark. That explains the breadth of mechanisms implemented—and also why we report evaluation gaps plainly.
