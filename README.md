@@ -9,6 +9,24 @@ Registered datasets:
 - `m-pv4ger`: binary aerial-RGB classification
 - `m-pv4ger-seg`: binary aerial-RGB segmentation
 - `m-chesapeake`: 7-class aerial RGB+NIR segmentation
+- `m-forestnet`: 12-class classification; Landsat-8 Red, Green, Blue, NIR, SWIR1, SWIR2 (uint8, 332x332)
+- `m-brick-kiln`: binary classification; 13 stored channels (64x64)
+- `m-nz-cattle`: binary aerial-RGB segmentation (500x500)
+- `m-cashew-plant`: 7-class segmentation; 12 Sentinel-2 bands plus cloud probability (256x256)
+
+Channels are always selected by verified physical index, never by GEO-Bench's
+stored band names. Per [geo-bench #29 / PR #30](https://github.com/ServiceNow/geo-bench/pull/30),
+`m-brick-kiln` stores `B01 B02 B03 B04 B05 B07 B8A B08 B11 B12 TCI_R TCI_G TCI_B`
+(no B06/B09/B10; the TCI channels are 8-bit true-colour composites) although its
+metadata claims the 13 standard Sentinel-2 bands; `m-eurosat` stores B8A last (#28),
+which the existing SSL4EO reorder already assumed. Each dataset offers explicit input
+views (`rgb`, `multispectral`, `sentinel2_13`, `dataset_channels`); excluded channels
+(brick-kiln TCI in the multispectral view, cashew cloud probability) are documented in
+`ml/registry.py` and recorded in every checkpoint. The four new datasets are
+standardized per channel with statistics from up to 256 evenly spaced training
+samples; the statistics are stored in the checkpoint and reused for final test
+evaluation. The original four datasets keep their fixed scaling and ImageNet
+normalization.
 
 To add another compatible GEO-Bench classification or semantic-segmentation dataset,
 add its verified contract to `ml/registry.py`. The loader, model factory, trainer,
@@ -194,6 +212,14 @@ Target configurations:
 - `resnet50_s2`: SSL4EO-S12 `B13_rn50_dino_0099.pth`
 - `unet_r34`: SMP U-Net with pinned ResNet-34 ImageNet encoder provenance
 - `deeplabv3plus_r50`: SMP DeepLabV3+ with pinned ResNet-50 ImageNet encoder provenance
+- `resnet18_ms`, `resnet50_ms`: TorchVision ImageNet ResNets for multispectral views
+
+Compatibility is a capability rule, not a dataset list: a model is offered when its
+task type matches and the dataset declares the input view it consumes. When a model
+takes more than three channels, its pretrained RGB filters are placed on the channels
+verified as red/green/blue and every other channel starts from the mean pretrained RGB
+filter (documented adaptation, never random). U-Net and DeepLabV3+ pad inputs to a
+multiple of 32 and crop outputs back, so `m-nz-cattle` trains at native 500x500.
 
 The existing `fcn_resnet50` implementation is retained as a legacy segmentation
 baseline but is not presented as one of the requested target configurations.

@@ -5,10 +5,11 @@ from ml.registry import get_dataset_spec, list_dataset_specs
 
 
 class DatasetRegistryTests(unittest.TestCase):
-    def test_selected_four_datasets_are_registered(self):
+    def test_all_eight_datasets_are_registered(self):
         self.assertEqual(
             {item["dataset_id"] for item in list_dataset_specs()},
-            {"m-eurosat", "m-pv4ger", "m-pv4ger-seg", "m-chesapeake"},
+            {"m-eurosat", "m-pv4ger", "m-pv4ger-seg", "m-chesapeake",
+             "m-forestnet", "m-brick-kiln", "m-nz-cattle", "m-cashew-plant"},
         )
 
     def test_task_specific_defaults(self):

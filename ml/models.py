@@ -14,7 +14,25 @@ def create_model(
     input_channels: int,
     pretrained: bool = True,
     pretrained_checkpoint: str | None = None,
+    rgb_positions: tuple[int, int, int] | None = (0, 1, 2),
 ):
+    """Build a registry model.
+
+    ``rgb_positions`` gives where the verified red, green, and blue channels sit
+    in the input; pretrained RGB filters are placed there when the first
+    convolution is adapted to more channels. Encoder-decoder models get input
+    padding hooks so any native resolution is preserved.
+    """
+    model = _build_model(name, task_type, num_classes, input_channels, pretrained,
+                         pretrained_checkpoint, rgb_positions)
+    multiple = get_model_spec(name).input_multiple
+    if multiple > 1:
+        apply_input_padding(model, multiple)
+    return model
+
+
+def _build_model(name, task_type, num_classes, input_channels, pretrained,
+                 pretrained_checkpoint, rgb_positions):
     spec = get_model_spec(name)
     if spec.task_type != task_type:
         raise ValueError(f"Model {spec.model_id!r} does not support {task_type!r}.")
@@ -42,6 +60,17 @@ def create_model(
         weights = ConvNeXt_Tiny_Weights.IMAGENET1K_V1 if pretrained else None
         model = convnext_tiny(weights=weights)
         model.classifier[-1] = torch.nn.Linear(model.classifier[-1].in_features, num_classes)
+        return model
+
+    if spec.model_id in {"resnet18_ms", "resnet50_ms"}:
+        builder, weights = (
+            (resnet18, ResNet18_Weights.IMAGENET1K_V1)
+            if spec.model_id == "resnet18_ms"
+            else (resnet50, ResNet50_Weights.IMAGENET1K_V1)
+        )
+        model = builder(weights=weights if pretrained else None)
+        _adapt_first_convolution(model, "conv1", input_channels, rgb_positions)
+        model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
         return model
 
     if spec.model_id == "resnet18_s2":
@@ -89,9 +118,9 @@ def create_model(
                 in_channels=3,
                 classes=num_classes,
             )
-        # Chesapeake's NIR channel has no ImageNet-pretrained weight. Initialize
-        # it explicitly from the mean of the pretrained RGB filters.
-        _adapt_first_convolution(model.encoder, "conv1", input_channels)
+        # Non-RGB channels have no ImageNet-pretrained weight. Initialize them
+        # explicitly from the mean of the pretrained RGB filters.
+        _adapt_first_convolution(model.encoder, "conv1", input_channels, rgb_positions)
         return model
 
     if spec.model_id == "fcn_resnet50":
@@ -101,7 +130,7 @@ def create_model(
             weights_backbone=backbone_weights,
             num_classes=num_classes,
         )
-        _adapt_first_convolution(model.backbone, "conv1", input_channels)
+        _adapt_first_convolution(model.backbone, "conv1", input_channels, rgb_positions)
         return model
     raise ValueError(f"No constructor exists for model {spec.model_id!r}.")
 
@@ -166,13 +195,29 @@ def _load_ssl4eo_dino(model, checkpoint_path: Path) -> None:
         )
 
 
-def _adapt_first_convolution(module, attribute: str, input_channels: int) -> None:
-    """Retain RGB weights and initialize extra channels from their mean."""
+def _adapt_first_convolution(
+    module,
+    attribute: str,
+    input_channels: int,
+    rgb_positions: tuple[int, int, int] | None = (0, 1, 2),
+) -> None:
+    """Place pretrained RGB filters on the verified RGB channels.
+
+    Every other channel is initialized from the mean of the pretrained RGB
+    filters. With ``rgb_positions=(0, 1, 2)`` this is the original behavior.
+    ``None`` means the input has no verified RGB channels, so every channel
+    gets the mean filter.
+    """
     import torch
 
     old = getattr(module, attribute)
-    if old.in_channels == input_channels:
+    positions = tuple(rgb_positions) if rgb_positions is not None else None
+    if old.in_channels == input_channels and positions == (0, 1, 2):
         return
+    if positions is not None and (
+        len(set(positions)) != 3 or any(not 0 <= p < input_channels for p in positions)
+    ):
+        raise ValueError(f"Invalid RGB positions {positions} for {input_channels} channels.")
     new = torch.nn.Conv2d(
         input_channels,
         old.out_channels,
@@ -182,14 +227,43 @@ def _adapt_first_convolution(module, attribute: str, input_channels: int) -> Non
         bias=old.bias is not None,
     )
     with torch.no_grad():
-        copy_channels = min(3, input_channels)
-        new.weight[:, :copy_channels] = old.weight[:, :copy_channels]
-        if input_channels > 3:
-            rgb_mean = old.weight[:, :3].mean(dim=1, keepdim=True)
-            new.weight[:, 3:] = rgb_mean.repeat(1, input_channels - 3, 1, 1)
+        rgb_mean = old.weight[:, :3].mean(dim=1, keepdim=True)
+        new.weight.copy_(rgb_mean.repeat(1, input_channels, 1, 1))
+        for source, target in enumerate(positions or ()):
+            new.weight[:, target] = old.weight[:, source]
         if old.bias is not None:
             new.bias.copy_(old.bias)
     setattr(module, attribute, new)
+
+
+def apply_input_padding(model, multiple: int) -> None:
+    """Pad inputs to a multiple of ``multiple`` and crop outputs back.
+
+    Uses forward hooks, so no parameters or state-dict keys change. Inputs that
+    are already a multiple pass through untouched. Image borders are reflected;
+    the cropped-away logits never reach the loss or metrics.
+    """
+    import torch.nn.functional as functional
+
+    def pad(module, args):
+        images = args[0]
+        height, width = images.shape[-2:]
+        pad_h, pad_w = (-height) % multiple, (-width) % multiple
+        module._gotrain_input_size = (height, width)
+        if not pad_h and not pad_w:
+            return None
+        mode = "reflect" if pad_h < height and pad_w < width else "replicate"
+        return (functional.pad(images, (0, pad_w, 0, pad_h), mode=mode), *args[1:])
+
+    def crop(module, args, output):
+        height, width = module._gotrain_input_size
+        if isinstance(output, dict):
+            return {key: value[..., :height, :width] for key, value in output.items()}
+        return output[..., :height, :width]
+
+    model.register_forward_pre_hook(pad)
+    model.register_forward_hook(crop)
+    model.gotrain_input_padding = {"multiple": multiple, "mode": "reflect", "output": "cropped"}
 
 
 def model_logits(output, task_type: str):

@@ -64,6 +64,7 @@ def run_smoke_test(
         data.input_channels,
         config.pretrained,
         checkpoint_path,
+        rgb_positions=data.rgb_positions,
     ).to(device)
     criterion_kwargs = {}
     if data.ignore_index is not None:
@@ -116,6 +117,17 @@ def run_smoke_test(
         "model": model_name,
         "device": str(device),
         "input_channels": data.input_channels,
+        "band_names": data.preprocessing["band_names"],
+        "excluded_channels": data.preprocessing["excluded_channels"],
+        "rgb_positions": data.preprocessing["rgb_positions"],
+        "normalization": (
+            data.preprocessing["normalization"]
+            if isinstance(data.preprocessing["normalization"], str)
+            else {key: data.preprocessing["normalization"][key]
+                  for key in ("type", "samples", "mean", "std", "constant_channels")}
+        ),
+        "input_padding": getattr(model, "gotrain_input_padding", None),
+        "class_names": data.class_names,
         "num_classes": data.num_classes,
         "native_resolution": list(data.native_resolution),
         "effective_resolution": list(data.effective_resolution),

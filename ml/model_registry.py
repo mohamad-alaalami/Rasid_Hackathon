@@ -13,7 +13,6 @@ class ModelSpec:
     model_id: str
     architecture: str
     task_type: str
-    datasets: tuple[str, ...]
     input_profile: str
     pretraining_source: str
     pretraining_status: str
@@ -26,6 +25,9 @@ class ModelSpec:
     preprocessing: str
     conservative_batch_size: int
     limitations: tuple[str, ...] = ()
+    # Inputs are padded to this multiple and outputs cropped back, so
+    # encoder-decoder models keep the dataset's native resolution.
+    input_multiple: int = 1
 
 
 MODEL_REGISTRY: dict[str, ModelSpec] = {
@@ -33,7 +35,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         model_id="resnet18_rgb",
         architecture="ResNet-18",
         task_type="classification",
-        datasets=("m-eurosat", "m-pv4ger"),
         input_profile="rgb",
         pretraining_source="TorchVision ImageNet-1K",
         pretraining_status="official_verified",
@@ -50,7 +51,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         model_id="resnet18_s2",
         architecture="ResNet-18",
         task_type="classification",
-        datasets=("m-eurosat",),
         input_profile="sentinel2_13",
         pretraining_source="SSL4EO-S12 MoCo, S2-L1C 13-band, epoch 99",
         pretraining_status="checkpoint_required",
@@ -68,7 +68,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         model_id="resnet50_s2",
         architecture="ResNet-50",
         task_type="classification",
-        datasets=("m-eurosat",),
         input_profile="sentinel2_13",
         pretraining_source="SSL4EO-S12 DINO, S2-L1C 13-band, epoch 99",
         pretraining_status="checkpoint_required",
@@ -86,7 +85,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         model_id="convnext_tiny_rgb",
         architecture="ConvNeXt-Tiny",
         task_type="classification",
-        datasets=("m-eurosat", "m-pv4ger"),
         input_profile="rgb",
         pretraining_source="TorchVision ImageNet-1K",
         pretraining_status="official_verified",
@@ -103,7 +101,6 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         model_id="unet_r34",
         architecture="U-Net with ResNet-34 encoder",
         task_type="segmentation",
-        datasets=("m-pv4ger-seg", "m-chesapeake"),
         input_profile="dataset_channels",
         pretraining_source="SMP ResNet-34 ImageNet encoder",
         pretraining_status="package_and_weights_required",
@@ -113,14 +110,17 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         license="MIT (SMP); encoder checkpoint provenance recorded by SMP",
         required_package="segmentation-models-pytorch",
         minimum_package_version="0.5.0",
-        preprocessing="ImageNet RGB normalization; Chesapeake NIR uses explicit mean-RGB weight adaptation",
+        preprocessing=(
+            "Pretrained RGB filters on the verified red/green/blue channels; every other "
+            "channel initialized from the mean pretrained RGB filter"
+        ),
         conservative_batch_size=8,
+        input_multiple=32,
     ),
     "deeplabv3plus_r50": ModelSpec(
         model_id="deeplabv3plus_r50",
         architecture="DeepLabV3+ with ResNet-50 encoder",
         task_type="segmentation",
-        datasets=("m-pv4ger-seg", "m-chesapeake"),
         input_profile="dataset_channels",
         pretraining_source="SMP ResNet-50 ImageNet encoder",
         pretraining_status="package_and_weights_required",
@@ -130,15 +130,58 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         license="MIT/BSD-3-Clause components (SMP); encoder checkpoint provenance recorded by SMP",
         required_package="segmentation-models-pytorch",
         minimum_package_version="0.5.0",
-        preprocessing="ImageNet RGB normalization; Chesapeake NIR uses explicit mean-RGB weight adaptation",
+        preprocessing=(
+            "Pretrained RGB filters on the verified red/green/blue channels; every other "
+            "channel initialized from the mean pretrained RGB filter"
+        ),
         conservative_batch_size=4,
+        input_multiple=32,
+    ),
+    "resnet18_ms": ModelSpec(
+        model_id="resnet18_ms",
+        architecture="ResNet-18 with multispectral input adaptation",
+        task_type="classification",
+        input_profile="multispectral",
+        pretraining_source="TorchVision ImageNet-1K",
+        pretraining_status="official_verified",
+        checkpoint_id="ResNet18_Weights.IMAGENET1K_V1",
+        checkpoint_url=None,
+        checkpoint_filename=None,
+        license="BSD-3-Clause (TorchVision code; ImageNet weights subject to dataset terms)",
+        required_package="torchvision",
+        minimum_package_version=None,
+        preprocessing=(
+            "All verified multispectral channels; pretrained RGB filters on the red/green/blue "
+            "channels, other channels initialized from the mean pretrained RGB filter"
+        ),
+        conservative_batch_size=32,
+        limitations=("Non-visible channels start from adapted RGB filters, not spectral pretraining.",),
+    ),
+    "resnet50_ms": ModelSpec(
+        model_id="resnet50_ms",
+        architecture="ResNet-50 with multispectral input adaptation",
+        task_type="classification",
+        input_profile="multispectral",
+        pretraining_source="TorchVision ImageNet-1K",
+        pretraining_status="official_verified",
+        checkpoint_id="ResNet50_Weights.IMAGENET1K_V1",
+        checkpoint_url=None,
+        checkpoint_filename=None,
+        license="BSD-3-Clause (TorchVision code; ImageNet weights subject to dataset terms)",
+        required_package="torchvision",
+        minimum_package_version=None,
+        preprocessing=(
+            "All verified multispectral channels; pretrained RGB filters on the red/green/blue "
+            "channels, other channels initialized from the mean pretrained RGB filter"
+        ),
+        conservative_batch_size=16,
+        limitations=("Non-visible channels start from adapted RGB filters, not spectral pretraining.",),
     ),
     # Existing implementation retained so the working segmentation pipeline is not removed.
     "fcn_resnet50": ModelSpec(
         model_id="fcn_resnet50",
         architecture="TorchVision FCN with ResNet-50 backbone",
         task_type="segmentation",
-        datasets=("m-pv4ger-seg", "m-chesapeake"),
         input_profile="dataset_channels",
         pretraining_source="TorchVision ResNet50_Weights.IMAGENET1K_V1 backbone",
         pretraining_status="legacy_engine_baseline",
@@ -213,28 +256,46 @@ def model_runtime_status(model_id: str, checkpoint_dir: str | Path = "checkpoint
     }
 
 
-def list_eligible_models(dataset_id: str, checkpoint_dir: str | Path = "checkpoints") -> list[dict[str, Any]]:
+def is_compatible(model_id: str, dataset_id: str) -> bool:
+    """Capability rule: same task type and the dataset offers the model's input view."""
+    from .registry import get_dataset_spec
+
+    spec = get_model_spec(model_id)
+    dataset = get_dataset_spec(dataset_id)
+    return spec.task_type == dataset.task_type and spec.input_profile in dataset.input_profiles
+
+
+def _dataset_input(spec: ModelSpec, dataset_id: str) -> dict[str, Any]:
     from .registry import get_dataset_spec
 
     dataset = get_dataset_spec(dataset_id)
-    results = []
-    for spec in MODEL_REGISTRY.values():
-        if dataset_id not in spec.datasets or spec.task_type != dataset.task_type:
-            continue
-        status = model_runtime_status(spec.model_id, checkpoint_dir)
-        if status["eligible"]:
-            results.append({**asdict(spec), **status})
-    return results
+    indices = dataset.profile_band_indices(spec.input_profile)
+    return {
+        "input_profile": spec.input_profile,
+        "band_indices": list(indices),
+        "band_names": dataset.channel_names(indices),
+        "input_channels": len(indices),
+    }
+
+
+def _option(spec: ModelSpec, dataset_id: str, checkpoint_dir) -> dict[str, Any]:
+    return {**asdict(spec), "dataset_input": _dataset_input(spec, dataset_id),
+            **model_runtime_status(spec.model_id, checkpoint_dir)}
+
+
+def compatible_models(dataset_id: str) -> list[str]:
+    return [model_id for model_id in MODEL_REGISTRY if is_compatible(model_id, dataset_id)]
+
+
+def list_eligible_models(dataset_id: str, checkpoint_dir: str | Path = "checkpoints") -> list[dict[str, Any]]:
+    options = list_model_options(dataset_id, checkpoint_dir)
+    return [option for option in options if option["eligible"]]
 
 
 def list_model_options(dataset_id: str, checkpoint_dir: str | Path = "checkpoints") -> list[dict[str, Any]]:
-    from .registry import get_dataset_spec
-
-    dataset = get_dataset_spec(dataset_id)
     return [
-        {**asdict(spec), **model_runtime_status(spec.model_id, checkpoint_dir)}
-        for spec in MODEL_REGISTRY.values()
-        if dataset_id in spec.datasets and spec.task_type == dataset.task_type
+        _option(MODEL_REGISTRY[model_id], dataset_id, checkpoint_dir)
+        for model_id in compatible_models(dataset_id)
     ]
 
 
@@ -243,9 +304,10 @@ def validate_model_for_dataset(model_id: str, dataset_id: str) -> str:
 
     spec = get_model_spec(model_id)
     dataset = get_dataset_spec(dataset_id)
-    if dataset_id not in spec.datasets or spec.task_type != dataset.task_type:
+    if not is_compatible(spec.model_id, dataset_id):
         raise ValueError(
             f"model={spec.model_id!r} is incompatible with dataset={dataset_id!r} "
-            f"({dataset.task_type})."
+            f"({dataset.task_type}; available input views {list(dataset.input_profiles)}, "
+            f"model needs {spec.input_profile!r})."
         )
     return spec.model_id

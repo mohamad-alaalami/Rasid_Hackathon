@@ -20,15 +20,19 @@ def inspect_dataset(dataset_id: str = "m-eurosat", benchmark_dir: str | None = N
     sample = train[0]
     actual_resolution = inspect_sample_resolution(sample, spec, spec.band_indices)
     selected = [np.asarray(_band_array(sample.bands[i])).squeeze() for i in spec.band_indices]
+    stored = [np.asarray(_band_array(band)).squeeze() for band in sample.bands]
     if spec.task_type == "classification":
         label_summary = {"type": type(sample.label).__name__, "value": int(sample.label)}
     else:
         mask = np.asarray(_band_array(sample.label)).squeeze()
         label_summary = {
             "type": type(sample.label).__name__,
+            "dtype": str(mask.dtype),
             "shape": list(mask.shape),
-            "classes_present": np.unique(mask).astype(int).tolist(),
+            # Classes in this one sample only; absent classes may exist elsewhere.
+            "classes_present_in_sample": np.unique(mask).astype(int).tolist(),
         }
+    label_type = getattr(task, "label_type", None)
     return {
         "dataset_id": dataset_id,
         "task_type": spec.task_type,
@@ -36,6 +40,7 @@ def inspect_dataset(dataset_id: str = "m-eurosat", benchmark_dir: str | None = N
         "train_samples": len(train),
         "validation_samples": len(validation),
         "num_classes": spec.num_classes,
+        "class_names": list(getattr(label_type, "class_names", None) or []),
         "native_resolution": list(spec.native_resolution),
         "actual_sample_resolution": list(actual_resolution),
         "supported_resolution_options": {
@@ -47,6 +52,24 @@ def inspect_dataset(dataset_id: str = "m-eurosat", benchmark_dir: str | None = N
         "input_dtypes": [str(array.dtype) for array in selected],
         "input_min": [float(array.min()) for array in selected],
         "input_max": [float(array.max()) for array in selected],
+        "stored_channels": [
+            {
+                "index": index,
+                "verified_name": spec.channel_names([index])[0],
+                "geobench_stored_name": getattr(band.band_info, "name", None)
+                if getattr(band, "band_info", None) is not None else None,
+                "dtype": str(array.dtype),
+                "min": float(array.min()),
+                "max": float(array.max()),
+            }
+            for index, (band, array) in enumerate(zip(sample.bands, stored))
+        ],
+        "input_views": {
+            profile: spec.channel_names(spec.profile_band_indices(profile))
+            for profile in spec.input_profiles
+        },
+        "normalization": spec.normalization,
+        "channel_notes": list(spec.channel_notes),
         "label": label_summary,
     }
 

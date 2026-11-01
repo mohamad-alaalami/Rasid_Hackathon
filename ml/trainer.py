@@ -129,6 +129,7 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             data.input_channels,
             cfg.pretrained,
             pretrained_checkpoint,
+            rgb_positions=data.rgb_positions,
         ).to(device)
         criterion_kwargs = {}
         if data.ignore_index is not None:
@@ -199,6 +200,7 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
                         "num_classes": data.num_classes,
                         "class_names": data.class_names,
                         "preprocessing": data.preprocessing,
+                        "input_padding": getattr(model, "gotrain_input_padding", None),
                         "pretraining": {
                             "source": model_spec.pretraining_source,
                             "checkpoint_id": model_spec.checkpoint_id,
