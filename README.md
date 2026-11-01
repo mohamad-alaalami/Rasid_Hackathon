@@ -99,6 +99,50 @@ is claimed, and one campaign per policy is not statistical evidence. Every run t
 from the registry's pretrained weights, because checkpoint resumption is unsupported.
 GPU time is measured and reported but not enforced as a budget.
 
+## Resource accounting
+
+Every `agent.main` campaign (and `agent.compare_policies` trial) records one session per
+agent process in `artifacts/campaigns/resources.jsonl`: provider-reported Bedrock tokens,
+model invocations (Strands event-loop cycles), LLM latency, and elapsed time. Training
+time is read from the existing experiment records (`training_seconds`, else
+`runtime_seconds`; never both). Values that were not reported are `unknown`, never zero.
+Costs need an explicit price file; copy `configs/prices.example.json` and fill it in.
+
+```bash
+python -m research.resource_accounting --campaign-id ID --prices configs/prices.json
+python -m research.resource_accounting --campaign-id ID --json
+```
+
+## Human-in-the-loop (`--hitl`)
+
+- `off` (default): fully autonomous; agent, prompt, and tools are unchanged.
+- `always`: before every training run Claude calls `request_human_consultation` with the
+  evidence, options (with exact configurations and measured-cost estimates), and its
+  recommendation. The human picks an option, delegates back to Claude, or stops.
+- `critical`: autonomous, but approval is required after `--hitl-failure-threshold`
+  consecutive failed runs, or when a run's measured-cost estimate exceeds
+  `--hitl-cost-threshold-usd`. Claude must consult before proposing code changes and may
+  consult when evidence is insufficient.
+
+With a cost threshold, a run whose cost cannot be estimated from measured runs of the
+same model asks the human by default (`--hitl-unknown-cost allow` opts out).
+
+The training tool checks approval before reservation, so blocked launches use no budget.
+A selected configuration must be launched exactly. A consultation raises a Strands
+interrupt: the agent loop stops (HITL agents run tools sequentially), the conversation
+and interrupt are saved by Strands' `FileSessionManager`, and no training job is running.
+By default the process exits; the human answers by request number and the campaign
+resumes once. `--hitl-interactive` instead asks on the terminal between agent calls.
+
+```bash
+python -m agent.main --hitl always --dataset m-pv4ger --feedback E2 --max-experiments 4 --campaign-id demo1
+python -m agent.hitl show --campaign-id demo1
+python -m agent.hitl respond --campaign-id demo1 --request-id 1 --choice A --note "keep native resolution"
+python -m agent.main --resume --campaign-id demo1
+python -m agent.main --hitl critical --dataset m-chesapeake --hitl-cost-threshold-usd 2 --prices configs/prices.json
+python -m agent.main --hitl always --hitl-interactive --dataset m-pv4ger
+```
+
 Run the Phase-A one-batch GPU checks before adding model architectures:
 
 ```bash

@@ -699,11 +699,13 @@ def make_registered_training_tool(
     training_fn=run_training,
     attempt_log: list[dict] | None = None,
     selection_policy: str = DEFAULT_POLICY,
+    launch_gate=None,
 ):
     """Create the only production tool that launches campaign GPU training.
 
     P0 exposes the original signature. P1 adds a required ``decision_record``
     that is validated before any reservation; both share one CampaignRunner.
+    ``launch_gate`` (HITL) can block a valid launch before reservation.
     """
     check_policy(selection_policy)
     runner = CampaignRunner(
@@ -796,9 +798,16 @@ def make_registered_training_tool(
                 "message": str(exc),
             })
 
+        approval = None
+        if launch_gate is not None:
+            approval, blocked = launch_gate.check(dataset_id, configuration)
+            if blocked:
+                return reject(blocked)
         response = launch_with_decision(
             lambda: runner.run(dataset_id, configuration), **identity
         )
+        if launch_gate is not None:
+            launch_gate.record_launch(approval, response)
         if attempt_log is not None:
             attempt_log.append({
                 "configuration": configuration,

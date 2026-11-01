@@ -1,0 +1,9 @@
+{
+  "currency": "USD",
+  "source": "Fill in from current AWS pricing for your region and instance; null means unknown.",
+  "bedrock_input_usd_per_million_tokens": null,
+  "bedrock_output_usd_per_million_tokens": null,
+  "bedrock_cache_read_usd_per_million_tokens": null,
+  "bedrock_cache_write_usd_per_million_tokens": null,
+  "gpu_instance_usd_per_hour": null
+}

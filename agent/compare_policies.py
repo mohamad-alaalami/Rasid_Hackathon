@@ -28,6 +28,7 @@ from agent.policies import (
     launch_with_decision,
 )
 from agent.policy_comparison import aggregate_policy_comparison, write_policy_reports
+from research.resource_accounting import CampaignSession, campaign_resource_report, load_prices
 from agent.tools import (
     execute_registered_training,
     inspect_dataset,
@@ -106,7 +107,8 @@ def run_policy(args, run_id, output_dir, repeat_index, policy, seed):
     # prompt and the training tool schema.
     prompt = _comparison_prompt(args, mode, campaign_id, initial_response["feedback"])
     started = time.perf_counter()
-    agent_result = agent(prompt)
+    with CampaignSession(campaign_id, model_id=args.model_id, label="policy_comparison") as session:
+        agent_result = session.call(agent, prompt)
     agent_seconds = time.perf_counter() - started
     decision_trace = build_decision_trace(mode, campaign_id, seed)
     records = load_campaign_experiments(mode, campaign_id, seed)
@@ -127,6 +129,7 @@ def run_policy(args, run_id, output_dir, repeat_index, policy, seed):
         "dataset": args.dataset,
         "max_experiments": args.max_experiments,
         "initial_configuration": initial_configuration,
+        "resources": campaign_resource_report(campaign_id, args.prices_data, mode, seed),
         "rejected_decision_records": sum(
             attempt["response"].get("error_code") == "INVALID_DECISION_RECORD"
             for attempt in attempts
@@ -158,11 +161,13 @@ def build_parser():
     parser.add_argument("--region", default="eu-central-1")
     parser.add_argument("--model-id", default="eu.anthropic.claude-sonnet-5-5")
     parser.add_argument("--output-root", default=str(OUTPUT_ROOT))
+    parser.add_argument("--prices", help="JSON file of explicit USD prices for cost reports.")
     return parser
 
 
 def main():
     args = build_parser().parse_args()
+    args.prices_data = load_prices(args.prices)
     if args.repeats < 1 or args.max_experiments < 2:
         raise SystemExit("--repeats must be >=1 and --max-experiments must be >=2")
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
@@ -194,6 +199,7 @@ def main():
             "measured GPU seconds are reported per policy instead"
         ),
         "checkpoint_resumption": "unsupported; every run starts from registry pretrained weights",
+        "prices": args.prices_data,
     }
     (output_dir / "run_config.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
