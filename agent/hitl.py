@@ -47,6 +47,7 @@ DELEGATE, STOP = "delegate", "stop"
 RUN_PARAMETERS = (
     "model_id", "epochs", "batch_size", "learning_rate", "weight_decay", "pretrained",
     "image_size", "early_stopping", "early_stopping_patience", "early_stopping_min_delta",
+    "pipeline",
 )
 INTERRUPT_NAME = "gotrain_human_consultation"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")

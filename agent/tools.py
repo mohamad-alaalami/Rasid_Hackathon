@@ -7,6 +7,7 @@ import torch
 from strands import tool
 
 from agent.feedback import build_campaign_report, build_feedback
+from agent.autonomy import AutonomyPolicy
 from agent.campaign import CampaignRunner
 from agent.policies import (
     DEFAULT_POLICY,
@@ -17,6 +18,7 @@ from agent.policies import (
     validate_decision_record,
 )
 from agent.experiments import (
+    _configuration_key,
     finalize_training,
     get_best_experiment,
     get_budget_status,
@@ -34,7 +36,10 @@ from ml.model_registry import (
     model_runtime_status,
     validate_model_for_dataset,
 )
+from ml.components import PipelineError
+from ml.config import TrainingConfig
 from ml.registry import list_dataset_specs
+from ml.solution import build_solution_spec, solution_exists, solution_id
 
 
 @tool
@@ -56,6 +61,8 @@ def agent_capabilities() -> dict:
             "Budget and duplicate checks",
             "Guarded training tool factory",
             "real autonomous multi-experiment campaigns",
+            "composable pipeline components (scope S1)",
+            "versioned, immutable solution specifications",
         ],
         "datasets": list_dataset_specs(),
         "pending": ["human-authorized final one-time test evaluation"],
@@ -615,18 +622,9 @@ def _make_dataset_training_tool(
     )
 
 
-def execute_registered_training(dataset_id, configuration, seed, training_fn=run_training):
-    """Run the real ML API and translate only its factual artifacts."""
+def campaign_training_config(dataset_id, configuration, seed):
+    """Translate a campaign configuration into ml.train_model's config mapping."""
     selected_model = validate_model_for_dataset(configuration["architecture"], dataset_id)
-    model_spec = get_model_spec(selected_model)
-    runtime = model_runtime_status(selected_model)
-    if not runtime["eligible"]:
-        raise ValueError(runtime["reason"])
-    if configuration["batch_size"] > model_spec.conservative_batch_size:
-        raise ValueError(
-            f"batch_size exceeds the {model_spec.conservative_batch_size} limit "
-            f"for {selected_model}."
-        )
     training_config = {
         "model": selected_model,
         "input_mode": "registry",
@@ -645,13 +643,42 @@ def execute_registered_training(dataset_id, configuration, seed, training_fn=run
         "device": "auto",
         "mixed_precision": True,
     }
-    result = training_fn(dataset_id=dataset_id, config=training_config)
+    if configuration.get("pipeline") is not None:
+        training_config["pipeline"] = configuration["pipeline"]
+    return training_config
+
+
+def campaign_solution(dataset_id, configuration, seed):
+    """Validate every pipeline constraint and return (solution_id, spec)."""
+    cfg = TrainingConfig.from_mapping(campaign_training_config(dataset_id, configuration, seed))
+    cfg.validate_for_dataset(dataset_id)
+    spec = build_solution_spec(dataset_id, cfg)
+    return solution_id(spec), spec
+
+
+def execute_registered_training(dataset_id, configuration, seed, training_fn=run_training,
+                                solution_context=None):
+    """Run the real ML API and translate only its factual artifacts."""
+    selected_model = validate_model_for_dataset(configuration["architecture"], dataset_id)
+    model_spec = get_model_spec(selected_model)
+    runtime = model_runtime_status(selected_model)
+    if not runtime["eligible"]:
+        raise ValueError(runtime["reason"])
+    if configuration["batch_size"] > model_spec.conservative_batch_size:
+        raise ValueError(
+            f"batch_size exceeds the {model_spec.conservative_batch_size} limit "
+            f"for {selected_model}."
+        )
+    training_config = campaign_training_config(dataset_id, configuration, seed)
+    extra = {} if solution_context is None else {"solution_context": solution_context}
+    result = training_fn(dataset_id=dataset_id, config=training_config, **extra)
     if result.get("status") != "completed":
         return {
             "status": "failed",
             "evaluation_split": "validation",
             "error": result.get("message", "Real ML training failed."),
             "ml_experiment_id": result.get("experiment_id"),
+            "solution_id": result.get("solution_id"),
             "training_seconds": result.get("training_seconds"),
             "log_path": result.get("log_path"),
             "native_resolution": result.get("native_resolution"),
@@ -686,7 +713,34 @@ def execute_registered_training(dataset_id, configuration, seed, training_fn=run
         "completed_epochs": result.get("completed_epochs", len(history)),
         "stopped_early": result.get("stopped_early", False),
         "stop_reason": result.get("stop_reason"),
+        "solution_id": result.get("solution_id"),
     }
+
+
+def check_run_arguments(dataset_id, model_id, epochs, batch_size, learning_rate, weight_decay,
+                        image_size, early_stopping_patience, early_stopping_min_delta):
+    """Deterministic argument, eligibility, and batch-limit checks; raises ValueError."""
+    if not 1 <= epochs <= 20:
+        raise ValueError("epochs must be between 1 and 20.")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive.")
+    if learning_rate <= 0 or weight_decay < 0:
+        raise ValueError("learning_rate must be positive and weight_decay nonnegative.")
+    if image_size is not None and image_size < 32:
+        raise ValueError("image_size must be at least 32 when explicitly set.")
+    if early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be at least 1.")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta cannot be negative.")
+    selected_model = validate_model_for_dataset(model_id, dataset_id)
+    model_spec = get_model_spec(selected_model)
+    runtime = model_runtime_status(selected_model)
+    if not runtime["eligible"]:
+        raise ValueError(runtime["reason"])
+    if batch_size > model_spec.conservative_batch_size:
+        raise ValueError(
+            f"batch_size exceeds limit {model_spec.conservative_batch_size}."
+        )
 
 
 def make_registered_training_tool(
@@ -700,28 +754,48 @@ def make_registered_training_tool(
     attempt_log: list[dict] | None = None,
     selection_policy: str = DEFAULT_POLICY,
     launch_gate=None,
+    autonomy: AutonomyPolicy | None = None,
 ):
     """Create the only production tool that launches campaign GPU training.
 
     P0 exposes the original signature. P1 adds a required ``decision_record``
     that is validated before any reservation; both share one CampaignRunner.
     ``launch_gate`` (HITL) can block a valid launch before reservation.
+    Scope S1 (``autonomy``) adds ``pipeline``, ``parent_solution_id``, and
+    ``change_description``; the default policy (A2/S0) keeps the original tool.
     """
     check_policy(selection_policy)
+    policy = autonomy or AutonomyPolicy()
+    # Lineage is not part of the configuration (it does not change training),
+    # so it reaches the trainer through this map keyed by configuration.
+    lineage: dict[str, dict] = {}
+
+    def solution_context(configuration):
+        return {
+            "campaign_id": campaign_id,
+            "feedback_version": version,
+            "selection_policy": selection_policy,
+            "autonomy": policy.to_dict(),
+            "proposer": "claude",
+            **lineage.pop(_configuration_key(configuration), {}),
+        }
+
     runner = CampaignRunner(
         version=version,
         campaign_id=campaign_id,
         seed=seed,
         max_experiments=max_experiments,
         executor=lambda dataset_id, configuration, run_seed: execute_registered_training(
-            dataset_id, configuration, run_seed, training_fn=training_fn
+            dataset_id, configuration, run_seed, training_fn=training_fn,
+            solution_context=solution_context(configuration),
         ),
     )
 
     def attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
                 weight_decay, pretrained, image_size, early_stopping,
                 early_stopping_patience, early_stopping_min_delta,
-                decision_record=None):
+                decision_record=None, pipeline=None, parent_solution_id=None,
+                change_description=None):
         identity = {
             "version": version,
             "campaign_id": campaign_id,
@@ -760,6 +834,8 @@ def make_registered_training_tool(
             "early_stopping_patience": early_stopping_patience,
             "early_stopping_min_delta": early_stopping_min_delta,
         }
+        if pipeline is not None:
+            configuration["pipeline"] = pipeline
         identity["configuration"] = configuration
         mismatch = check_campaign_policy(campaign_id, seed, selection_policy)
         if mismatch:
@@ -770,33 +846,39 @@ def make_registered_training_tool(
                 return reject(error)
             identity["decision_record"] = normalized
         try:
-            if not 1 <= epochs <= 20:
-                raise ValueError("epochs must be between 1 and 20.")
-            if batch_size < 1:
-                raise ValueError("batch_size must be positive.")
-            if learning_rate <= 0 or weight_decay < 0:
-                raise ValueError("learning_rate must be positive and weight_decay nonnegative.")
-            if image_size is not None and image_size < 32:
-                raise ValueError("image_size must be at least 32 when explicitly set.")
-            if early_stopping_patience < 1:
-                raise ValueError("early_stopping_patience must be at least 1.")
-            if early_stopping_min_delta < 0:
-                raise ValueError("early_stopping_min_delta cannot be negative.")
-            selected_model = validate_model_for_dataset(model_id, dataset_id)
-            model_spec = get_model_spec(selected_model)
-            runtime = model_runtime_status(selected_model)
-            if not runtime["eligible"]:
-                raise ValueError(runtime["reason"])
-            if batch_size > model_spec.conservative_batch_size:
-                raise ValueError(
-                    f"batch_size exceeds limit {model_spec.conservative_batch_size}."
-                )
+            check_run_arguments(dataset_id, model_id, epochs, batch_size, learning_rate,
+                                weight_decay, image_size, early_stopping_patience,
+                                early_stopping_min_delta)
         except Exception as exc:
             return reject({
                 "status": "rejected",
                 "error_code": "INVALID_MODEL_CONFIGURATION",
                 "message": str(exc),
             })
+        if pipeline is not None or parent_solution_id or policy.requires_proposal:
+            try:
+                sid, _ = campaign_solution(dataset_id, configuration, seed)
+            except PipelineError as exc:
+                return reject({
+                    "status": "rejected",
+                    "error_code": "INVALID_PIPELINE",
+                    "errors": exc.errors,
+                    "message": "Unsupported pipeline combination; no budget was used.",
+                })
+            except Exception as exc:
+                return reject({"status": "rejected", "error_code": "INVALID_MODEL_CONFIGURATION",
+                               "message": str(exc)})
+            if parent_solution_id and not solution_exists(parent_solution_id):
+                return reject({"status": "rejected", "error_code": "UNKNOWN_PARENT_SOLUTION",
+                               "message": f"No solution {parent_solution_id!r} exists."})
+            blocked = policy.check_launch(sid, campaign_id)
+            if blocked:
+                return reject(blocked)
+            if parent_solution_id or change_description:
+                lineage[_configuration_key(configuration)] = {
+                    "parent_solution_id": parent_solution_id,
+                    "change_description": change_description,
+                }
 
         approval = None
         if launch_gate is not None:
@@ -815,6 +897,9 @@ def make_registered_training_tool(
                 "response": response,
             })
         return response
+
+    if policy.composes_pipelines:
+        return _composable_tool(attempt, selection_policy)
 
     if selection_policy == "P0":
         @tool
@@ -877,6 +962,82 @@ def make_registered_training_tool(
                        weight_decay, pretrained, image_size, early_stopping,
                        early_stopping_patience, early_stopping_min_delta,
                        decision_record)
+
+    return run_campaign_experiment
+
+
+def _composable_tool(attempt, selection_policy):
+    """Scope S1 variants of run_campaign_experiment (P0 and P1)."""
+    if selection_policy == "P0":
+        @tool
+        def run_campaign_experiment(
+            dataset_id: str,
+            model_id: str,
+            epochs: int,
+            batch_size: int,
+            learning_rate: float,
+            weight_decay: float = 0.0001,
+            pretrained: bool = True,
+            image_size: int | None = None,
+            early_stopping: bool = False,
+            early_stopping_patience: int = 3,
+            early_stopping_min_delta: float = 0.0,
+            pipeline: dict | None = None,
+            parent_solution_id: str | None = None,
+            change_description: str | None = None,
+        ) -> dict:
+            """Run one real train/validation experiment within the campaign budget.
+
+            Args:
+                pipeline: Optional composed components (see list_pipeline_components):
+                    input_view, normalization, augmentations, loss, optimizer, scheduler,
+                    dropout. Omitted keys keep the defaults; unsupported combinations are
+                    rejected before any budget is used.
+                parent_solution_id: Optional earlier solution this one changes.
+                change_description: Optional description of what changed and why.
+            """
+            return attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
+                           weight_decay, pretrained, image_size, early_stopping,
+                           early_stopping_patience, early_stopping_min_delta, None,
+                           pipeline, parent_solution_id, change_description)
+
+        return run_campaign_experiment
+
+    @tool
+    def run_campaign_experiment(
+        decision_record: dict,
+        dataset_id: str,
+        model_id: str,
+        epochs: int,
+        batch_size: int,
+        learning_rate: float,
+        weight_decay: float = 0.0001,
+        pretrained: bool = True,
+        image_size: int | None = None,
+        early_stopping: bool = False,
+        early_stopping_patience: int = 3,
+        early_stopping_min_delta: float = 0.0,
+        pipeline: dict | None = None,
+        parent_solution_id: str | None = None,
+        change_description: str | None = None,
+    ) -> dict:
+        """Run one real train/validation experiment within the campaign budget.
+
+        Args:
+            decision_record: Required object with nonempty string fields
+                observation, action, expected_signal, and cost_justification.
+                Malformed records are rejected before any training or budget use.
+            pipeline: Optional composed components (see list_pipeline_components):
+                input_view, normalization, augmentations, loss, optimizer, scheduler,
+                dropout. Omitted keys keep the defaults; unsupported combinations are
+                rejected before any budget is used.
+            parent_solution_id: Optional earlier solution this one changes.
+            change_description: Optional description of what changed and why.
+        """
+        return attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
+                       weight_decay, pretrained, image_size, early_stopping,
+                       early_stopping_patience, early_stopping_min_delta,
+                       decision_record, pipeline, parent_solution_id, change_description)
 
     return run_campaign_experiment
 

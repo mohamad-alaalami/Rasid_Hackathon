@@ -20,6 +20,8 @@ from agent.hitl import (
     pending_request,
     session_exists,
 )
+from agent.autonomy import AVAILABLE_SCOPES, CLAUDE_AUTHORITIES, AutonomyPolicy
+from agent.pipeline_tools import make_pipeline_tools
 from agent.policies import SELECTION_POLICIES, build_decision_trace, build_system_prompt
 from agent.prompts import SYSTEM_PROMPT
 from agent.store_tools import make_store_tools, store_campaign_instructions
@@ -38,7 +40,8 @@ from agent.tools import (
 from research.resource_accounting import CampaignSession, campaign_resource_report, load_prices
 
 # Campaign arguments restored from HITL state on --resume.
-RESUMED_SETTINGS = ("feedback", "policy", "seed", "max_experiments", "dataset", "model_id", "region")
+RESUMED_SETTINGS = ("feedback", "policy", "seed", "max_experiments", "dataset", "model_id", "region",
+                    "authority", "scope")
 
 
 def _bedrock_model(model_id: str, region: str):
@@ -58,7 +61,8 @@ def setup_hitl(args, campaign_id: str, prices):
         except HitlError as exc:
             raise SystemExit(str(exc))
         for field in RESUMED_SETTINGS:
-            setattr(args, field, settings[field])
+            # States saved before a setting existed resume with its default.
+            setattr(args, field, settings.get(field, getattr(args, field)))
         args.hitl = settings["hitl_mode"]
         return controller
     if state is not None:
@@ -87,6 +91,7 @@ def setup_hitl(args, campaign_id: str, prices):
 
 
 def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
+    autonomy = AutonomyPolicy(authority=args.authority, scope=args.scope)
     tools = [
         agent_capabilities,
         inspect_gpu,
@@ -100,6 +105,7 @@ def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
             max_experiments=args.max_experiments,
             required_dataset=args.dataset,
             selection_policy=args.policy,
+            autonomy=autonomy,
             launch_gate=hitl,
         ),
         make_campaign_report_tool(args.feedback, campaign_id, args.seed),
@@ -109,7 +115,11 @@ def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
     if args.feedback == "E3":
         tools.append(make_campaign_diagnostics_tool(args.feedback, campaign_id, args.seed))
     tools.extend(make_store_tools(args.feedback))
-    system_prompt = build_system_prompt(args.policy)
+    tools.extend(make_pipeline_tools(
+        version=args.feedback, campaign_id=campaign_id, seed=args.seed, autonomy=autonomy,
+        selection_policy=args.policy, required_dataset=args.dataset,
+    ))
+    system_prompt = build_system_prompt(args.policy) + autonomy.instructions()
     extra = {}
     if hitl is not None:
         tools.append(hitl.make_tool())
@@ -238,6 +248,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GoTrain real autonomous ML agent")
     parser.add_argument("--mode", choices=("campaign", "smoke"), default="campaign")
     parser.add_argument("--feedback", choices=("E0", "E1", "E2", "E3"), default="E3")
+    parser.add_argument(
+        "--authority", choices=CLAUDE_AUTHORITIES, default="A2",
+        help="A2: Claude chooses and launches (default). A1: launches must be proposed first.",
+    )
+    parser.add_argument(
+        "--scope", choices=AVAILABLE_SCOPES, default="S0",
+        help="S0: existing knobs (default). S1: also compose pipeline components.",
+    )
     parser.add_argument(
         "--policy", choices=SELECTION_POLICIES, default="P0",
         help="Experiment selection: P0 free, P1 evidence-grounded decision records.",

@@ -131,6 +131,45 @@ python -m research.resource_accounting --campaign-id ID --prices configs/prices.
 python -m research.resource_accounting --campaign-id ID --json
 ```
 
+## Composable pipelines, solutions, and autonomy
+
+`ml/components.py` defines every supported training component with its parameters and
+compatibility constraints: input view and normalization, spatial augmentations
+(`hflip`, `vflip`, `rot90`, `random_resized_crop`; masks move with images), photometric
+augmentations (`brightness`, `contrast`, `gaussian_noise`; one shared factor across all
+channels, so band relationships are preserved), losses (`cross_entropy` with label
+smoothing, `focal`, segmentation-only `dice_cross_entropy`, optional inverse-frequency
+class weights), optimizers (`adamw`, `sgd`), schedulers (`cosine`, `constant`, `step`,
+`warmup_cosine`), and classification-head `dropout`. A `pipeline` object in the training
+config selects them; omitted keys keep the historical defaults (flips, cross-entropy,
+AdamW, cosine), so existing campaigns are unchanged. Incompatible combinations are
+rejected with every reason listed.
+
+```bash
+python -m ml.smoke_test --dataset-id m-cashew-plant --model unet_r34 \
+  --pipeline '{"loss": {"name": "dice_cross_entropy", "class_weighting": "inverse_frequency"}, "augmentations": [{"name": "rot90"}, {"name": "hflip"}]}'
+```
+
+Every training run is recorded against an immutable, content-addressed `SolutionSpec`
+under `artifacts/solutions/<solution_id>/` (`$GOTRAIN_SOLUTIONS_DIR` overrides):
+`spec.json` (dataset contract hash, input channels, normalization policy, model and
+pretrained provenance, pipeline, training settings, seed) and an append-only
+`events.jsonl` with proposals (parent solution, change description, campaign, autonomy)
+and executions (validation results, resources, checkpoint SHA-256, environment, dataset
+fingerprint). `initialization` and `custom_components` are reserved for later warm starts
+and sandboxed code.
+
+Autonomy has two independent axes, separate from P0/P1 and HITL:
+`--authority A2` (default: Claude chooses and launches) or `A1` (launches must first be
+proposed with `propose_solution`), and `--scope S0` (default: existing knobs) or `S1`
+(compose pipeline components via `list_pipeline_components`, a `pipeline` argument,
+`parent_solution_id`/`change_description`, and `inspect_solutions`). A0 (system
+decisions) and S2 (sandboxed code) are reserved.
+
+```bash
+python -m agent.main --dataset m-forestnet --feedback E2 --scope S1 --max-experiments 3
+```
+
 ## Human-in-the-loop (`--hitl`)
 
 - `off` (default): fully autonomous; agent, prompt, and tools are unchanged.

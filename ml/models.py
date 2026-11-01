@@ -236,6 +236,36 @@ def _adapt_first_convolution(
     setattr(module, attribute, new)
 
 
+def classification_head(model):
+    """The final Linear layer of a classification model (ResNet ``fc`` or ConvNeXt classifier)."""
+    import torch
+
+    head = getattr(model, "fc", None)
+    if isinstance(head, torch.nn.Linear):
+        return head
+    classifier = getattr(model, "classifier", None)
+    if isinstance(classifier, torch.nn.Sequential) and isinstance(classifier[-1], torch.nn.Linear):
+        return classifier[-1]
+    raise ValueError(f"{type(model).__name__} has no supported classification head for dropout.")
+
+
+def apply_head_dropout(model, probability: float) -> None:
+    """Dropout on the classifier input, active only in training mode.
+
+    Implemented as a forward pre-hook so the state dict is unchanged and saved
+    checkpoints load into a plain model for evaluation.
+    """
+    import torch.nn.functional as functional
+
+    if probability <= 0:
+        return
+    head = classification_head(model)
+    head.register_forward_pre_hook(
+        lambda module, args: (functional.dropout(args[0], probability, module.training), *args[1:])
+    )
+    model.gotrain_head_dropout = probability
+
+
 def apply_input_padding(model, multiple: int) -> None:
     """Pad inputs to a multiple of ``multiple`` and crop outputs back.
 

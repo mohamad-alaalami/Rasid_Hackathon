@@ -21,13 +21,15 @@ def run_smoke_test(
     pretrained_checkpoint: str | None = None,
     pretrained: bool = True,
     image_size: int | None = None,
+    pipeline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one train batch and one validation batch without touching test data."""
     import torch
 
     from .dataset import create_dataloaders
     from .evaluate import evaluate_model
-    from .models import create_model, model_logits, validate_model_output_shape
+    from .components import build_training_components
+    from .models import apply_head_dropout, create_model, model_logits, validate_model_output_shape
     from .model_registry import get_model_spec
 
     config = TrainingConfig.from_mapping(
@@ -44,6 +46,7 @@ def run_smoke_test(
             "checkpoint_dir": checkpoint_dir,
             "pretrained_checkpoint": pretrained_checkpoint,
             "image_size": image_size,
+            "pipeline": pipeline,
         }
     )
     model_name = config.validate_for_dataset(dataset_id)
@@ -66,11 +69,12 @@ def run_smoke_test(
         checkpoint_path,
         rgb_positions=data.rgb_positions,
     ).to(device)
-    criterion_kwargs = {}
-    if data.ignore_index is not None:
-        criterion_kwargs["ignore_index"] = data.ignore_index
-    criterion = torch.nn.CrossEntropyLoss(**criterion_kwargs)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    apply_head_dropout(model, data.pipeline["dropout"])
+    criterion, optimizer, _ = build_training_components(
+        data.pipeline, model, num_classes=data.num_classes, ignore_index=data.ignore_index,
+        class_counts=data.class_counts, learning_rate=config.learning_rate,
+        weight_decay=config.weight_decay, epochs=1, device=device,
+    )
 
     train_images, train_targets = next(iter(data.train_loader))
     train_images = train_images.to(device)
@@ -128,6 +132,9 @@ def run_smoke_test(
         ),
         "input_padding": getattr(model, "gotrain_input_padding", None),
         "class_names": data.class_names,
+        "pipeline": data.pipeline,
+        "criterion": type(criterion).__name__,
+        "optimizer": type(optimizer).__name__,
         "num_classes": data.num_classes,
         "native_resolution": list(data.native_resolution),
         "effective_resolution": list(data.effective_resolution),
@@ -160,6 +167,8 @@ def main() -> None:
         help="Explicit square resize for a deliberate memory experiment; native is default.",
     )
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--pipeline", type=json.loads,
+                        help="Pipeline components as JSON (see ml/components.py).")
     args = parser.parse_args()
     try:
         result = run_smoke_test(
@@ -171,6 +180,7 @@ def main() -> None:
             pretrained_checkpoint=args.pretrained_checkpoint,
             pretrained=not args.no_pretrained,
             image_size=args.image_size,
+            pipeline=args.pipeline,
         )
     except Exception as exc:
         result = {

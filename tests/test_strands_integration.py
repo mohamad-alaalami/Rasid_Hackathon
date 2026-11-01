@@ -90,7 +90,7 @@ class FakeTrainer:
     def __init__(self, directory):
         self.directory, self.calls = Path(directory), []
 
-    def __call__(self, *, dataset_id, config):
+    def __call__(self, *, dataset_id, config, **solution_context):
         self.calls.append(config)
         metrics = self.directory / f"metrics_{len(self.calls)}.json"
         metrics.write_text(json.dumps([{"train_loss": 0.5, "val_loss": 0.6,

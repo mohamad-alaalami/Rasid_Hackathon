@@ -33,6 +33,9 @@ class TrainingConfig:
     early_stopping: bool = False
     early_stopping_patience: int = 3
     early_stopping_min_delta: float = 0.0
+    # Composable pipeline components (ml/components.py). None reproduces the
+    # historical pipeline exactly: flips, cross-entropy, AdamW, cosine schedule.
+    pipeline: dict[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "TrainingConfig":
@@ -59,6 +62,7 @@ class TrainingConfig:
             "early_stopping": bool,
             "early_stopping_patience": int,
             "early_stopping_min_delta": Real,
+            "pipeline": (dict, type(None)),
         }
         for name, value in raw.items():
             expected = expected_types[name]
@@ -109,11 +113,29 @@ class TrainingConfig:
             raise ValueError("device must be 'auto', 'cpu', or 'cuda'.")
         if self.benchmark_dir is not None and not Path(self.benchmark_dir).is_dir():
             raise ValueError(f"benchmark_dir does not exist: {self.benchmark_dir}")
+        self.resolved_pipeline()
+
+    def resolved_pipeline(self) -> dict[str, Any]:
+        from .components import resolve_pipeline
+
+        return resolve_pipeline(self.pipeline)
 
     def validate_for_dataset(self, dataset_id: str) -> str:
-        from .model_registry import validate_model_for_dataset
+        """Check model compatibility and every pipeline constraint for the dataset."""
+        from .components import PipelineError, compatibility_errors
+        from .dataset import resolve_effective_resolution
+        from .model_registry import get_model_spec, validate_model_for_dataset
+        from .registry import get_dataset_spec
 
-        return validate_model_for_dataset(self.model, dataset_id)
+        model_id = validate_model_for_dataset(self.model, dataset_id)
+        dataset = get_dataset_spec(dataset_id)
+        errors = compatibility_errors(
+            self.resolved_pipeline(), dataset, get_model_spec(model_id),
+            resolve_effective_resolution(dataset, self.image_size), self.epochs,
+        )
+        if errors:
+            raise PipelineError(errors)
+        return model_id
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

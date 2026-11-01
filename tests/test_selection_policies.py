@@ -39,7 +39,7 @@ class FakeTrainer:
         self.directory = Path(directory)
         self.calls = []
 
-    def __call__(self, *, dataset_id, config):
+    def __call__(self, *, dataset_id, config, **solution_context):
         self.calls.append((dataset_id, config))
         score = {0.0003: 0.71, 0.001: 0.72}[config["learning_rate"]]
         metrics = self.directory / f"metrics_{len(self.calls)}.json"

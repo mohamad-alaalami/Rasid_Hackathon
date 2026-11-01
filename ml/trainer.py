@@ -68,12 +68,29 @@ def _publish_model_version(result: dict[str, Any], experiment_dir: Path) -> dict
     return publish_experiment(result, experiment_dir)
 
 
-def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
-    """Train one registered classification or segmentation experiment."""
+def _record_solution_run(solution_id, run: dict[str, Any]) -> None:
+    from .solution import environment_info, record_run
+
+    record_run(solution_id, {**run, "environment": environment_info()})
+
+
+def train_model(
+    dataset_id: str,
+    config: Mapping[str, Any],
+    solution_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Train one registered classification or segmentation experiment.
+
+    Every run is recorded against an immutable SolutionSpec (ml/solution.py).
+    ``solution_context`` carries optional lineage and campaign metadata.
+    """
     experiment_id = datetime.now(timezone.utc).strftime("exp_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
     try:
+        from .solution import build_solution_spec, propose_solution
+
         cfg = TrainingConfig.from_mapping(config)
         selected_model = cfg.validate_for_dataset(dataset_id)
+        solution_id = propose_solution(build_solution_spec(dataset_id, cfg), solution_context)
     except Exception as exc:
         return {
             "status": "failed",
@@ -89,7 +106,7 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     metrics_path = experiment_dir / "metrics.json"
     checkpoint_path = experiment_dir / "best.pt"
     log_path = experiment_dir / "error.log"
-    _json_write(config_path, {"dataset_id": dataset_id, **cfg.to_dict()})
+    _json_write(config_path, {"dataset_id": dataset_id, "solution_id": solution_id, **cfg.to_dict()})
     started = time.perf_counter()
     data = None
 
@@ -99,7 +116,13 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         from .dataset import create_dataloaders
         from .evaluate import evaluate_model
         from .model_registry import get_model_spec, model_runtime_status
-        from .models import create_model, model_logits, validate_model_output_shape
+        from .components import build_training_components, class_weights
+        from .models import (
+            apply_head_dropout,
+            create_model,
+            model_logits,
+            validate_model_output_shape,
+        )
 
         _seed_everything(cfg.seed)
         device = _select_device(cfg.device)
@@ -110,7 +133,9 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             config_path,
             {
                 "dataset_id": dataset_id,
+                "solution_id": solution_id,
                 **cfg.to_dict(),
+                "resolved_pipeline": data.pipeline,
                 "native_resolution": list(data.native_resolution),
                 "effective_resolution": list(data.effective_resolution),
             },
@@ -131,14 +156,22 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             pretrained_checkpoint,
             rgb_positions=data.rgb_positions,
         ).to(device)
-        criterion_kwargs = {}
-        if data.ignore_index is not None:
-            criterion_kwargs["ignore_index"] = data.ignore_index
-        criterion = torch.nn.CrossEntropyLoss(**criterion_kwargs)
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
+        apply_head_dropout(model, data.pipeline["dropout"])
+        criterion, optimizer, scheduler = build_training_components(
+            data.pipeline,
+            model,
+            num_classes=data.num_classes,
+            ignore_index=data.ignore_index,
+            class_counts=data.class_counts,
+            learning_rate=cfg.learning_rate,
+            weight_decay=cfg.weight_decay,
+            epochs=cfg.epochs,
+            device=device,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+        weights = class_weights(
+            data.class_counts, data.pipeline["loss"].get("class_weighting", "none"), data.ignore_index
+        )
+        weights = None if weights is None else [round(float(w), 6) for w in weights]
         amp_enabled = bool(cfg.mixed_precision and device.type == "cuda")
         scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
@@ -201,6 +234,10 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
                         "class_names": data.class_names,
                         "preprocessing": data.preprocessing,
                         "input_padding": getattr(model, "gotrain_input_padding", None),
+                        "solution_id": solution_id,
+                        "pipeline": data.pipeline,
+                        "class_counts": data.class_counts,
+                        "class_weights": weights,
                         "pretraining": {
                             "source": model_spec.pretraining_source,
                             "checkpoint_id": model_spec.checkpoint_id,
@@ -260,6 +297,9 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
             "pretrained_checkpoint_id": model_spec.checkpoint_id,
             "preprocessing": data.preprocessing,
             "model_environment": model_environment,
+            "solution_id": solution_id,
+            "pipeline": data.pipeline,
+            "class_weights": weights,
         }
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -271,6 +311,38 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         result[f"best_val_{data.primary_metric}"] = best_accuracy
         result.update(_publish_model_version(result, experiment_dir))
         _json_write(experiment_dir / "result.json", result)
+        from .solution import file_sha256
+
+        _record_solution_run(solution_id, {
+            "run_id": experiment_id,
+            "status": "completed",
+            "campaign_id": (solution_context or {}).get("campaign_id"),
+            "validation": {
+                "split": "validation",
+                "primary_metric": data.primary_metric,
+                "best_val_score": best_accuracy,
+                "best_epoch": best_epoch,
+                "final_epoch": history[-1],
+            },
+            "resources": {
+                "training_seconds": result["training_seconds"],
+                "peak_gpu_memory_mb": result["peak_gpu_memory_mb"],
+                "device": result["device"],
+                "requested_epochs": cfg.epochs,
+                "completed_epochs": len(history),
+                "stopped_early": stopped_early,
+            },
+            "artifacts": {
+                "experiment_dir": str(experiment_dir),
+                "checkpoint_path": str(checkpoint_path),
+                "checkpoint_sha256": file_sha256(checkpoint_path),
+                "metrics_path": str(metrics_path),
+                "config_path": str(config_path),
+                "optimizer_state_path": None,  # not saved in Phase 1A
+            },
+            "class_weights": weights,
+            "dataset_fingerprint": data.dataset_fingerprint,
+        })
         return result
     except Exception as exc:
         log_path.write_text(traceback.format_exc(), encoding="utf-8")
@@ -293,6 +365,18 @@ def train_model(dataset_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         if data is not None:
             result["native_resolution"] = list(data.native_resolution)
             result["effective_resolution"] = list(data.effective_resolution)
+        result["solution_id"] = solution_id
         _json_write(experiment_dir / "result.json", result)
+        try:
+            _record_solution_run(solution_id, {
+                "run_id": experiment_id,
+                "status": "failed",
+                "campaign_id": (solution_context or {}).get("campaign_id"),
+                "error_type": result["error_type"],
+                "error": message,
+                "resources": {"training_seconds": result["training_seconds"]},
+            })
+        except Exception:  # the training failure is the error worth reporting
+            pass
         return result
 

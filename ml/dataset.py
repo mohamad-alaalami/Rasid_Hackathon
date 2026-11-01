@@ -82,13 +82,18 @@ class GeoBenchDataset:
         normalization: str,
         effective_resolution: tuple[int, int],
         augment: bool,
+        augmentations: list[dict] | None = None,
     ):
+        from .components import DEFAULT_AUGMENTATIONS
+
         self.dataset = dataset
         self.spec = spec
         self.band_indices = band_indices
         self.normalization = normalization
         self.effective_resolution = effective_resolution
         self.augment = augment
+        # Resolved augmentation list; None keeps the historical flips.
+        self.augmentations = list(DEFAULT_AUGMENTATIONS if augmentations is None else augmentations)
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -106,15 +111,7 @@ class GeoBenchDataset:
         image_np = np.stack(arrays, axis=0).astype(np.float32)
         if image_np.ndim != 3 or not np.isfinite(image_np).all():
             raise ValueError(f"Invalid image tensor shape or values: {image_np.shape}.")
-        if isinstance(self.normalization, dict):
-            # Training-split channel statistics, stored in the checkpoint so the
-            # sealed test evaluation applies exactly the same transform.
-            mean = np.asarray(self.normalization["mean"], dtype=np.float32)[:, None, None]
-            std = np.asarray(self.normalization["std"], dtype=np.float32)[:, None, None]
-            if mean.shape[0] != image_np.shape[0]:
-                raise ValueError("Channel statistics do not match the selected channels.")
-            image_np = (image_np - mean) / std
-        else:
+        if not isinstance(self.normalization, dict):
             image_np = np.clip(image_np / self.spec.scale_divisor, 0.0, 1.0)
         image = torch.from_numpy(np.ascontiguousarray(image_np))
 
@@ -130,9 +127,22 @@ class GeoBenchDataset:
             if valid.numel() and (int(valid.min()) < 0 or int(valid.max()) >= self.spec.num_classes):
                 raise ValueError("Segmentation mask contains a class outside the registry contract.")
 
-        image, target = self._resize_and_augment(image, target)
+        image, target = self._resize(image, target)
+        if self.augment:
+            # Photometric ops act in data units, before standardization.
+            from .components import apply_augmentations
+
+            image, target = apply_augmentations(
+                image, target, self.augmentations, self.spec.task_type
+            )
         if isinstance(self.normalization, dict):
-            return image, target
+            # Training-split channel statistics, stored in the checkpoint so the
+            # sealed test evaluation applies exactly the same transform.
+            mean = torch.tensor(self.normalization["mean"], dtype=image.dtype)[:, None, None]
+            std = torch.tensor(self.normalization["std"], dtype=image.dtype)[:, None, None]
+            if mean.shape[0] != image.shape[0]:
+                raise ValueError("Channel statistics do not match the selected channels.")
+            return (image - mean) / std, target
         if self.normalization == "imagenet_rgb":
             mean_values, std_values = IMAGENET_MEAN, IMAGENET_STD
         elif self.normalization == "imagenet_rgb_plus_nir":
@@ -146,8 +156,7 @@ class GeoBenchDataset:
         std = torch.tensor(std_values, dtype=image.dtype)[:, None, None]
         return (image - mean) / std, target
 
-    def _resize_and_augment(self, image, target):
-        import torch
+    def _resize(self, image, target):
         import torch.nn.functional as functional
 
         if tuple(image.shape[-2:]) != self.effective_resolution:
@@ -164,14 +173,6 @@ class GeoBenchDataset:
                     size=self.effective_resolution,
                     mode="nearest",
                 )[0, 0].long()
-        if self.augment and torch.rand(()) < 0.5:
-            image = torch.flip(image, dims=(-1,))
-            if self.spec.task_type == "segmentation":
-                target = torch.flip(target, dims=(-1,))
-        if self.augment and torch.rand(()) < 0.5:
-            image = torch.flip(image, dims=(-2,))
-            if self.spec.task_type == "segmentation":
-                target = torch.flip(target, dims=(-2,))
         return image, target
 
 
@@ -190,6 +191,10 @@ class DataBundle:
     preprocessing: dict[str, Any]
     # Where red/green/blue sit in the input, for first-convolution adaptation.
     rgb_positions: tuple[int, int, int] | None = (0, 1, 2)
+    # Resolved pipeline and training-label counts (only when class weighting is used).
+    pipeline: dict[str, Any] | None = None
+    class_counts: list[int] | None = None
+    dataset_fingerprint: dict[str, Any] | None = None
 
 
 def inspect_sample_resolution(
@@ -260,6 +265,24 @@ def compute_channel_statistics(dataset: Any, band_indices: tuple[int, ...],
     }
 
 
+def compute_class_counts(dataset: Any, spec: DatasetSpec, max_samples: int = 512) -> list[int]:
+    """Label (or mask-pixel) counts over evenly spaced training samples."""
+    np, _ = _require_ml_dependencies()
+    count = len(dataset)
+    picks = sorted({int(round(value)) for value in np.linspace(0, count - 1, min(count, max_samples))})
+    counts = np.zeros(spec.num_classes, dtype=np.int64)
+    for index in picks:
+        sample = dataset[index]
+        if spec.task_type == "classification":
+            counts[_classification_label(sample, spec)] += 1
+            continue
+        mask = np.asarray(_band_array(sample.label)).astype(np.int64).ravel()
+        if spec.ignore_index is not None:
+            mask = mask[mask != spec.ignore_index]
+        counts += np.bincount(mask, minlength=spec.num_classes)[: spec.num_classes]
+    return counts.tolist()
+
+
 def _check_channel_count(sample: Any, spec: DatasetSpec) -> None:
     bands = getattr(sample, "bands", None)
     count = 0 if bands is None else len(bands)
@@ -283,22 +306,30 @@ def create_dataloaders(dataset_id: str, config) -> DataBundle:
     spec = get_dataset_spec(dataset_id)
     from .model_registry import get_model_spec
 
+    from .components import selected_view
+    from .solution import dataset_fingerprint
+
     model_spec = get_model_spec(config.model)
-    profile = model_spec.input_profile
+    pipeline = config.resolved_pipeline()
+    view = selected_view(pipeline, model_spec)
     # Physical channel indices come from the verified registry view. For
     # sentinel2_13 this reorders storage order into SSL4EO-S12's canonical
     # B01..B08, B8A, B09..B12 order.
-    band_indices = spec.profile_band_indices(profile)
-    if spec.normalization == "scale_imagenet":
+    band_indices = spec.profile_band_indices(view)
+    use_channel_stats = (
+        pipeline["normalization"] == "train_channel_stats"
+        or spec.normalization == "train_channel_stats"
+    )
+    if not use_channel_stats:
         normalization = {
             "sentinel2_13": "none",
             "rgb": "imagenet_rgb",
             "dataset_channels": (
                 "imagenet_rgb" if len(band_indices) == 3 else "imagenet_rgb_plus_nir"
             ),
-        }.get(profile)
+        }.get(view)
         if normalization is None:
-            raise ValueError(f"{dataset_id} has no fixed normalization for {profile!r} inputs.")
+            raise ValueError(f"{dataset_id} has no fixed normalization for {view!r} inputs.")
     task = find_task(dataset_id, config.benchmark_dir)
     # Load all bands, then apply verified physical indices from the registry.
     # This is essential for datasets such as m-eurosat whose stored band names
@@ -306,8 +337,12 @@ def create_dataloaders(dataset_id: str, config) -> DataBundle:
     train_source = task.get_dataset(split="train", band_names=None)
     val_source = task.get_dataset(split="valid", band_names=None)
     _check_channel_count(train_source[0], spec)
-    if spec.normalization == "train_channel_stats":
+    if use_channel_stats:
         normalization = compute_channel_statistics(train_source, band_indices)
+    class_counts = (
+        compute_class_counts(train_source, spec)
+        if pipeline["loss"].get("class_weighting", "none") != "none" else None
+    )
     train_resolution = inspect_sample_resolution(train_source[0], spec, band_indices)
     val_resolution = inspect_sample_resolution(val_source[0], spec, band_indices)
     if train_resolution != spec.native_resolution or val_resolution != spec.native_resolution:
@@ -318,7 +353,8 @@ def create_dataloaders(dataset_id: str, config) -> DataBundle:
         )
     effective_resolution = resolve_effective_resolution(spec, config.image_size)
     train_dataset = GeoBenchDataset(
-        train_source, spec, band_indices, normalization, effective_resolution, augment=True
+        train_source, spec, band_indices, normalization, effective_resolution, augment=True,
+        augmentations=pipeline["augmentations"],
     )
     val_dataset = GeoBenchDataset(
         val_source, spec, band_indices, normalization, effective_resolution, augment=False
@@ -355,8 +391,12 @@ def create_dataloaders(dataset_id: str, config) -> DataBundle:
         native_resolution=spec.native_resolution,
         effective_resolution=effective_resolution,
         rgb_positions=rgb_positions,
+        pipeline=pipeline,
+        class_counts=class_counts,
+        dataset_fingerprint=dataset_fingerprint(task),
         preprocessing={
             "input_profile": model_spec.input_profile,
+            "input_view": view,
             "band_indices": list(band_indices),
             "band_names": spec.channel_names(band_indices),
             "excluded_channels": spec.channel_names(

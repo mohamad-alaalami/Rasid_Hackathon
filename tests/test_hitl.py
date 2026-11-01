@@ -39,7 +39,7 @@ class FakeTrainer:
         self.seconds = seconds
         self.calls = []
 
-    def __call__(self, *, dataset_id, config):
+    def __call__(self, *, dataset_id, config, **solution_context):
         self.calls.append(config)
         if config["learning_rate"] >= 0.5:
             return {"status": "failed", "message": "CUDA out of memory", "training_seconds": 1.0}
