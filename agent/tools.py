@@ -756,6 +756,7 @@ def make_registered_training_tool(
     selection_policy: str = DEFAULT_POLICY,
     launch_gate=None,
     autonomy: AutonomyPolicy | None = None,
+    search_graph=None,
 ):
     """Create the only production tool that launches campaign GPU training.
 
@@ -859,7 +860,8 @@ def make_registered_training_tool(
                 "error_code": "INVALID_MODEL_CONFIGURATION",
                 "message": str(exc),
             })
-        if pipeline is not None or parent_solution_id or policy.requires_proposal:
+        if (pipeline is not None or parent_solution_id or policy.requires_proposal
+                or search_graph is not None):
             try:
                 sid, _ = campaign_solution(dataset_id, configuration, seed)
             except PipelineError as exc:
@@ -878,6 +880,10 @@ def make_registered_training_tool(
             blocked = policy.check_launch(sid, campaign_id)
             if blocked:
                 return reject(blocked)
+            if search_graph is not None:  # search mode: only proposed graph nodes run
+                blocked = search_graph.check_launch(sid)
+                if blocked:
+                    return reject(blocked)
             if parent_solution_id or change_description:
                 lineage[_configuration_key(configuration)] = {
                     "parent_solution_id": parent_solution_id,

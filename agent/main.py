@@ -22,6 +22,8 @@ from agent.hitl import (
 )
 from agent.autonomy import AVAILABLE_SCOPES, CLAUDE_AUTHORITIES, AutonomyPolicy
 from agent.pipeline_tools import make_pipeline_tools
+from agent.search_graph import HISTORY_MODES, SearchGraph
+from agent.search_tools import SEARCH_INSTRUCTIONS, make_search_tools
 from agent.policies import SELECTION_POLICIES, build_decision_trace, build_system_prompt
 from agent.prompts import SYSTEM_PROMPT
 from agent.store_tools import make_store_tools, store_campaign_instructions
@@ -41,7 +43,7 @@ from research.resource_accounting import CampaignSession, campaign_resource_repo
 
 # Campaign arguments restored from HITL state on --resume.
 RESUMED_SETTINGS = ("feedback", "policy", "seed", "max_experiments", "dataset", "model_id", "region",
-                    "authority", "scope")
+                    "authority", "scope", "search")
 
 
 def _bedrock_model(model_id: str, region: str):
@@ -90,8 +92,19 @@ def setup_hitl(args, campaign_id: str, prices):
     return HitlController(campaign_id, settings)
 
 
+def search_graph_for(args, campaign_id: str):
+    """The campaign's search graph in --search mode, else None (historical behavior)."""
+    if not getattr(args, "search", False):
+        return None
+    if args.feedback not in HISTORY_MODES:
+        raise SystemExit(f"--search exposes the solution graph (history); use --feedback "
+                         f"{' or '.join(HISTORY_MODES)}, not {args.feedback}.")
+    return SearchGraph(campaign_id, args.feedback, args.seed, args.max_experiments, args.dataset)
+
+
 def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
     autonomy = AutonomyPolicy(authority=args.authority, scope=args.scope)
+    graph = search_graph_for(args, campaign_id)
     tools = [
         agent_capabilities,
         inspect_gpu,
@@ -107,6 +120,7 @@ def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
             selection_policy=args.policy,
             autonomy=autonomy,
             launch_gate=hitl,
+            search_graph=graph,
         ),
         make_campaign_report_tool(args.feedback, campaign_id, args.seed),
     ]
@@ -120,6 +134,10 @@ def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
         selection_policy=args.policy, required_dataset=args.dataset,
     ))
     system_prompt = build_system_prompt(args.policy) + autonomy.instructions()
+    if graph is not None:
+        tools.extend(make_search_tools(graph=graph, autonomy=autonomy,
+                                       required_dataset=args.dataset))
+        system_prompt += SEARCH_INSTRUCTIONS
     extra = {}
     if hitl is not None:
         tools.append(hitl.make_tool())
@@ -220,6 +238,8 @@ def run_campaign(args) -> str:
         "best_validation_score": best.get("validation_score") if best else None,
         "best_checkpoint_path": best.get("checkpoint_path") if best else None,
         "decision_trace": build_decision_trace(args.feedback, campaign_id, args.seed),
+        "search_graph": (search_graph_for(args, campaign_id).frontier()
+                         if getattr(args, "search", False) else None),
         "resources": resources,
     }
     print("\nFINAL PERSISTED CAMPAIGN REPORT")
@@ -279,6 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true",
                         help="Resume a paused HITL campaign given by --campaign-id.")
     parser.add_argument("--prices", help="JSON file of explicit USD prices for cost reports.")
+    parser.add_argument("--search", action="store_true",
+                        help="Solution search graph: branch from any candidate; needs E2/E3.")
     parser.add_argument("--max-experiments", type=int, default=5)
     parser.add_argument("--campaign-id", help="Resume an existing campaign ID.")
     parser.add_argument("--dataset", help="Optional registered dataset restriction.")
