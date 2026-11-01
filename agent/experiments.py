@@ -420,12 +420,16 @@ def reserve_training(
     max_gpu_seconds=None,
     requested_gpu_seconds=None,
     allowed_values=None,
+    admit=None,
 ):
     """
     Atomically reserve a training attempt BEFORE GPU use.
 
     A reservation consumes one experiment slot even
     when training later fails or the process restarts.
+    ``admit(campaign_runs)`` is an optional extra check evaluated under the
+    same lock (for example "this continuation still starts from the latest
+    state"); it returns a rejection dict or None. It must not take the lock.
     """
     _check_version(version)
     _check_identity(campaign_id, dataset, seed)
@@ -487,6 +491,11 @@ def reserve_training(
                     "message": "This configuration was already launched.",
                     "existing_experiment_id": run["experiment_id"],
                 }
+
+        if admit is not None:
+            refused = admit(campaign_runs)
+            if refused:
+                return refused
 
         launched, gpu_used = _budget_usage(campaign_runs)
 

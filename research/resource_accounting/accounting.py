@@ -338,7 +338,8 @@ def estimate_run_cost(dataset, configuration, prices):
         "measured_runs": len(per_epoch),
         "basis": None,
     }
-    epochs = configuration.get("epochs")
+    # An adaptive-compute action trains only its allocated epochs, not the horizon.
+    epochs = (configuration.get("allocation") or {}).get("epochs", configuration.get("epochs"))
     if not per_epoch or not _number(epochs, allow_zero=False):
         estimate["basis"] = (
             f"no measured completed run of {architecture} at image_size "

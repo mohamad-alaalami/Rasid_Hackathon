@@ -20,6 +20,7 @@ from agent.hitl import (
     pending_request,
     session_exists,
 )
+from agent.allocation import ALLOCATION_INSTRUCTIONS, ComputeAllocator, make_allocation_tools
 from agent.autonomy import AVAILABLE_SCOPES, CLAUDE_AUTHORITIES, AutonomyPolicy
 from agent.pipeline_tools import make_pipeline_tools
 from agent.search_graph import HISTORY_MODES, SearchGraph
@@ -43,7 +44,7 @@ from research.resource_accounting import CampaignSession, campaign_resource_repo
 
 # Campaign arguments restored from HITL state on --resume.
 RESUMED_SETTINGS = ("feedback", "policy", "seed", "max_experiments", "dataset", "model_id", "region",
-                    "authority", "scope", "search")
+                    "authority", "scope", "search", "adaptive_compute", "max_training_seconds")
 
 
 def _bedrock_model(model_id: str, region: str):
@@ -102,9 +103,21 @@ def search_graph_for(args, campaign_id: str):
     return SearchGraph(campaign_id, args.feedback, args.seed, args.max_experiments, args.dataset)
 
 
+def allocator_for(args, graph):
+    """The adaptive compute allocator with --adaptive-compute (requires --search), else None."""
+    if not getattr(args, "adaptive_compute", False):
+        return None
+    if graph is None:
+        raise SystemExit("--adaptive-compute allocates compute to search-graph candidates; "
+                         "add --search.")
+    return ComputeAllocator(graph, max_experiments=args.max_experiments,
+                            max_gpu_seconds=getattr(args, "max_training_seconds", None))
+
+
 def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
     autonomy = AutonomyPolicy(authority=args.authority, scope=args.scope)
     graph = search_graph_for(args, campaign_id)
+    allocator = allocator_for(args, graph)
     tools = [
         agent_capabilities,
         inspect_gpu,
@@ -121,6 +134,8 @@ def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
             autonomy=autonomy,
             launch_gate=hitl,
             search_graph=graph,
+            max_gpu_seconds=getattr(args, "max_training_seconds", None),
+            allocator=allocator,
         ),
         make_campaign_report_tool(args.feedback, campaign_id, args.seed),
     ]
@@ -138,6 +153,9 @@ def create_campaign_agent(args, campaign_id: str, hitl=None) -> Agent:
         tools.extend(make_search_tools(graph=graph, autonomy=autonomy,
                                        required_dataset=args.dataset))
         system_prompt += SEARCH_INSTRUCTIONS
+    if allocator is not None:
+        tools.extend(make_allocation_tools(allocator))
+        system_prompt += ALLOCATION_INSTRUCTIONS
     extra = {}
     if hitl is not None:
         tools.append(hitl.make_tool())
@@ -240,6 +258,9 @@ def run_campaign(args) -> str:
         "decision_trace": build_decision_trace(args.feedback, campaign_id, args.seed),
         "search_graph": (search_graph_for(args, campaign_id).frontier()
                          if getattr(args, "search", False) else None),
+        "compute_allocation": (
+            allocator_for(args, search_graph_for(args, campaign_id)).report()
+            if getattr(args, "adaptive_compute", False) else None),
         "resources": resources,
     }
     print("\nFINAL PERSISTED CAMPAIGN REPORT")
@@ -301,6 +322,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prices", help="JSON file of explicit USD prices for cost reports.")
     parser.add_argument("--search", action="store_true",
                         help="Solution search graph: branch from any candidate; needs E2/E3.")
+    parser.add_argument("--adaptive-compute", action="store_true",
+                        help="With --search: Claude allocates epochs per candidate and continues "
+                             "promising ones from their saved training state.")
+    parser.add_argument("--max-training-seconds", type=float,
+                        help="With --adaptive-compute: cumulative wall-clock training budget.")
     parser.add_argument("--max-experiments", type=int, default=5)
     parser.add_argument("--campaign-id", help="Resume an existing campaign ID.")
     parser.add_argument("--dataset", help="Optional registered dataset restriction.")
@@ -321,6 +347,11 @@ def main() -> None:
         raise SystemExit("--resume requires --campaign-id")
     if args.hitl_failure_threshold < 1:
         raise SystemExit("--hitl-failure-threshold must be positive")
+    if args.adaptive_compute and not args.search:
+        raise SystemExit("--adaptive-compute requires --search")
+    if args.max_training_seconds is not None and (
+            not args.adaptive_compute or not args.max_training_seconds > 0):
+        raise SystemExit("--max-training-seconds must be positive and needs --adaptive-compute")
     run_campaign(args) if args.mode == "campaign" else run_smoke(args)
 
 

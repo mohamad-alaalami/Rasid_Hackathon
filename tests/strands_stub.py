@@ -22,6 +22,10 @@ def real_strands_available():
 def install():
     if real_strands_available():
         return False
+    if hasattr(sys.modules.get("strands.interrupt"), "InterruptException"):
+        # Already installed: keep the same classes, since modules imported earlier
+        # (agent.hitl) catch InterruptException by identity.
+        return True
     module = sys.modules.get("strands") or types.ModuleType("strands")
 
     def tool(func=None, **_options):

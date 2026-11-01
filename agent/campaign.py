@@ -15,14 +15,18 @@ from agent.feedback import build_feedback
 
 
 class CampaignRunner:
-    def __init__(self, *, version, campaign_id, seed, max_experiments, executor):
+    def __init__(self, *, version, campaign_id, seed, max_experiments, executor,
+                 max_gpu_seconds=None):
         self.version = version
         self.campaign_id = campaign_id
         self.seed = seed
         self.max_experiments = max_experiments
         self.executor = executor
+        # Cumulative wall-clock training-time budget (seconds). Each launch reserves
+        # all remaining time and the executor receives it as max_runtime_seconds.
+        self.max_gpu_seconds = max_gpu_seconds
 
-    def run(self, dataset_id, configuration):
+    def run(self, dataset_id, configuration, admit=None):
         reservation = reserve_training(
             self.version,
             self.campaign_id,
@@ -30,12 +34,16 @@ class CampaignRunner:
             self.seed,
             configuration,
             max_experiments=self.max_experiments,
+            max_gpu_seconds=self.max_gpu_seconds,
+            admit=admit,
         )
         if reservation["status"] != "reserved":
             return reservation
         started = time.perf_counter()
+        deadline = {} if self.max_gpu_seconds is None else {
+            "max_runtime_seconds": reservation["max_runtime_seconds"]}
         try:
-            result = self.executor(dataset_id, configuration, self.seed)
+            result = self.executor(dataset_id, configuration, self.seed, **deadline)
             if not isinstance(result, dict):
                 raise TypeError("Training executor must return a dictionary.")
             if result.get("evaluation_split") != "validation":
@@ -66,6 +74,7 @@ class CampaignRunner:
             dataset_id,
             self.seed,
             max_experiments=self.max_experiments,
+            max_gpu_seconds=self.max_gpu_seconds,
         )
         return {
             "status": record["status"],

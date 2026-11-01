@@ -13,6 +13,14 @@ Each line is one event:
   combination), plus intent, observation, hypothesis, expected signal, the
   changes Claude claimed, and the delta the system computed from the specs.
 * ``conclude``: Claude ended the search; later launches are refused.
+* ``allocation`` / ``allocation_outcome`` / ``abandon`` (adaptive compute,
+  agent/allocation.py): Claude's compute decisions with their justification and
+  outcome. An abandoned candidate receives no further compute.
+
+A candidate may be trained in several segments (an initial allocation and
+continuations of the same training run); its node aggregates them: the
+measured validation score is the best over completed segments, and its
+checkpoint is the one that produced that score.
 
 Writes happen under the experiment-storage lock, after re-reading the log, so
 concurrent proposals cannot create cycles or duplicate edges. Ancestry is not
@@ -142,6 +150,10 @@ class SearchGraph:
                                           "edges_in": []})
                 if edge["child"] not in nodes[parent]["children"]:
                     nodes[parent]["children"].append(edge["child"])
+        for event in events:
+            if event["type"] == "abandon" and event["solution_id"] in nodes:
+                nodes[event["solution_id"]]["abandoned"] = {
+                    key: event[key] for key in ("at", "reason")}
         concluded = next((e for e in reversed(events) if e["type"] == "conclude"), None)
         return nodes, edges, concluded
 
@@ -156,10 +168,12 @@ class SearchGraph:
         for record in records:
             sid = record.get("solution_id") or self._solution_for_record(record)
             if sid:
-                runs[sid] = record
+                runs.setdefault(sid, []).append(record)
         for sid, node in nodes.items():
-            node.update(self._node_result(sid, runs.get(sid)))
-        return {"nodes": nodes, "edges": edges, "records": records, "concluded": concluded}
+            node.setdefault("abandoned", None)
+            node.update(self._node_result(sid, runs.get(sid, [])))
+        return {"nodes": nodes, "edges": edges, "records": records, "concluded": concluded,
+                "events": events}
 
     def _solution_for_record(self, record):
         """Recompute a run's solution id from its configuration (robust to crashes)."""
@@ -170,31 +184,69 @@ class SearchGraph:
         except Exception:
             return None
 
-    def _node_result(self, sid, record):
-        spec = load_solution(sid)["spec"]
+    @staticmethod
+    def _score(record):
+        score = record.get("validation_score")
+        if (record.get("status") == "completed" and isinstance(score, (int, float))
+                and not isinstance(score, bool) and math.isfinite(score)):
+            return float(score)
+        return None
+
+    def _node_result(self, sid, records):
+        """Aggregate a candidate's training segments (one record per training action)."""
+        solution = load_solution(sid)
+        spec = solution["spec"]
         result = {"spec": spec, "status": "proposed", "experiment_id": None,
                   "validation_score": None, "primary_metric": None, "training_seconds": None,
-                  "checkpoint_path": None, "checkpoint_sha256": None, "error": None}
-        if record is None:
+                  "checkpoint_path": None, "checkpoint_sha256": None, "error": None,
+                  "segments": len(records), "epochs_completed": 0,
+                  "horizon_epochs": spec["training"]["epochs"]}
+        if not records:
             return result
-        status = record.get("status")
+        latest = records[-1]
+        scored = [record for record in records if self._score(record) is not None]
+        metric = next((r.get("primary_metric") for r in reversed(records)
+                       if r.get("primary_metric")), None)
+        if scored:
+            sign = -1 if METRIC_DIRECTION.get(metric) == "min" else 1
+            best = max(scored, key=lambda record: sign * self._score(record))
+        else:
+            best = None
+        if latest.get("status") == "launched":
+            status = "running"
+        elif best is not None:
+            status = "completed"  # a measured result exists even if a later segment failed
+        else:
+            status = latest.get("status")
+        chosen = best or latest
         result.update({
-            "status": {"launched": "running"}.get(status, status),
-            "experiment_id": record.get("experiment_id"),
-            "primary_metric": record.get("primary_metric"),
-            "error": record.get("error"),
+            "status": status,
+            "experiment_id": chosen.get("experiment_id"),
+            "primary_metric": metric,
+            "error": latest.get("error") if latest.get("status") == "failed" else None,
+            "validation_score": self._score(best) if best else None,
         })
-        score = record.get("validation_score")
-        if status == "completed" and isinstance(score, (int, float)) and math.isfinite(score):
-            result["validation_score"] = float(score)
-        seconds = record.get("training_seconds", record.get("runtime_seconds"))
-        if status in ("completed", "failed") and isinstance(seconds, (int, float)):
-            result["training_seconds"] = float(seconds)  # unknown stays None
-        for run in reversed(load_solution(sid)["runs"]):
-            if run.get("campaign_id") == self.campaign_id and run.get("artifacts"):
-                result["checkpoint_path"] = run["artifacts"].get("checkpoint_path")
-                result["checkpoint_sha256"] = run["artifacts"].get("checkpoint_sha256")
-                break
+        seconds = []
+        for record in records:
+            value = record.get("training_seconds", record.get("runtime_seconds"))
+            finished = record.get("status") in ("completed", "failed")
+            seconds.append(float(value) if finished and isinstance(value, (int, float)) else None)
+        # Unknown stays unknown: any finished-or-interrupted segment without a measurement.
+        result["training_seconds"] = None if None in seconds else sum(seconds)
+        result["epochs_completed"] = max(
+            [r.get("completed_through_epoch") or r.get("completed_epochs") or 0
+             for r in records if r.get("status") == "completed"] or [0])
+        if best is not None and best.get("checkpoint_sha256"):
+            result["checkpoint_path"] = best.get("checkpoint_path")
+            result["checkpoint_sha256"] = best["checkpoint_sha256"]
+        else:
+            wanted = (best or {}).get("ml_experiment_id")
+            for run in reversed(solution["runs"]):
+                if (run.get("campaign_id") == self.campaign_id and run.get("artifacts")
+                        and (wanted is None or run.get("run_id") == wanted)):
+                    result["checkpoint_path"] = run["artifacts"].get("checkpoint_path")
+                    result["checkpoint_sha256"] = run["artifacts"].get("checkpoint_sha256")
+                    break
         return result
 
     @staticmethod
@@ -236,7 +288,8 @@ class SearchGraph:
     # -- proposals -----------------------------------------------------------------
 
     def propose(self, child_spec, *, parents, intent, observation, hypothesis, expected_signal,
-                claimed_changes=None, changes_from_second_parent=None, context=None):
+                claimed_changes=None, changes_from_second_parent=None, context=None,
+                configuration=None):
         """Validate and append one edge atomically; returns the edge (new or existing)."""
         parents = list(parents or [])
         errors = {}
@@ -300,6 +353,8 @@ class SearchGraph:
                 "initialization": "fresh (ancestry is not a warm start)",
                 "proposer": (context or {}).get("proposer", "claude"),
             }
+            if configuration is not None:  # the run arguments that reproduce this node
+                edge["configuration"] = configuration
             self._append(edge)
             return {**edge, "duplicate": False}
 
@@ -354,7 +409,36 @@ class SearchGraph:
                     "message": "Propose this solution with propose_branch (naming its parent) "
                                "before launching it. No budget was used.",
                     "solution_id": solution_id}
+        if node["abandoned"]:
+            return {"status": "rejected", "error_code": "CANDIDATE_ABANDONED",
+                    "message": f"{solution_id} was abandoned ({node['abandoned']['reason']}); "
+                               "it receives no further compute. No budget was used.",
+                    "solution_id": solution_id}
         return None
+
+    def configuration_for(self, solution_id):
+        """The recorded run arguments of a node (from the latest edge that carries them)."""
+        with experiments._locked_storage():
+            events = self._events()
+        for event in reversed(events):
+            if (event["type"] == "edge" and event["child"] == solution_id
+                    and event.get("configuration") is not None):
+                return event["configuration"]
+        return None
+
+    def append_event(self, event):
+        """Append an allocation/abandon event under the storage lock."""
+        if event.get("type") not in ("allocation", "allocation_outcome", "abandon"):
+            raise ValueError(f"unsupported event type {event.get('type')!r}")
+        with experiments._locked_storage():
+            nodes, _, concluded = self._topology(self._events())
+            if event.get("solution_id") not in nodes:
+                raise SearchError("UNKNOWN_SOLUTION", f"{event.get('solution_id')} is not a node")
+            if concluded and event["type"] != "allocation_outcome":
+                raise SearchError("SEARCH_CONCLUDED", "the search was concluded")
+            stamped = {"at": _now(), "campaign_id": self.campaign_id, **event}
+            self._append(stamped)
+            return stamped
 
     # -- views ---------------------------------------------------------------------
 
@@ -367,6 +451,10 @@ class SearchGraph:
             "children": node["children"], "model": spec["model"]["model_id"],
             "input_view": spec["inputs"]["input_view"],
             "custom_components": [c["component_id"] for c in spec.get("custom_components", [])],
+            "segments": node.get("segments", 0),
+            "epochs_completed": node.get("epochs_completed", 0),
+            "horizon_epochs": node.get("horizon_epochs"),
+            "abandoned": node.get("abandoned"),
         }
 
     def frontier(self):
@@ -379,11 +467,13 @@ class SearchGraph:
             "nodes": [self.summary(n) for n in sorted(nodes.values(), key=lambda n: n["solution_id"])],
             "edges": [{k: e[k] for k in ("edge_id", "parents", "child", "intent", "hypothesis")}
                       for e in current["edges"]],
-            "ready_to_launch": sorted(s for s, n in nodes.items() if n["status"] == "proposed"),
+            "ready_to_launch": sorted(s for s, n in nodes.items()
+                                     if n["status"] == "proposed" and not n["abandoned"]),
             "failed": sorted(s for s, n in nodes.items() if n["status"] == "failed"),
             "incumbents": self.incumbents(nodes),
-            "budget": {key: budget[key] for key in ("launched_experiments", "max_experiments",
-                                                    "remaining_experiments")},
+            "budget": {key: budget[key] for key in (
+                "launched_experiments", "max_experiments", "remaining_experiments",
+                "gpu_seconds_used_or_reserved", "max_gpu_seconds", "remaining_gpu_seconds")},
             "concluded": current["concluded"],
         }
 

@@ -658,8 +658,13 @@ def campaign_solution(dataset_id, configuration, seed):
 
 
 def execute_registered_training(dataset_id, configuration, seed, training_fn=run_training,
-                                solution_context=None):
-    """Run the real ML API and translate only its factual artifacts."""
+                                solution_context=None, max_runtime_seconds=None):
+    """Run the real ML API and translate only its factual artifacts.
+
+    ``configuration["allocation"]`` (adaptive compute) trains epochs up to
+    ``until_epoch`` of the ``epochs`` horizon, saves a resumable training state,
+    and, for a continuation, resumes the recorded state (verified by SHA-256).
+    """
     selected_model = validate_model_for_dataset(configuration["architecture"], dataset_id)
     model_spec = get_model_spec(selected_model)
     runtime = model_runtime_status(selected_model)
@@ -672,18 +677,28 @@ def execute_registered_training(dataset_id, configuration, seed, training_fn=run
         )
     training_config = campaign_training_config(dataset_id, configuration, seed)
     extra = {} if solution_context is None else {"solution_context": solution_context}
+    allocation = configuration.get("allocation")
+    if allocation is not None:
+        extra.update(until_epoch=allocation["until_epoch"], save_training_state=True)
+        if allocation.get("resume_state_path"):
+            extra["resume_from"] = {"path": allocation["resume_state_path"],
+                                    "sha256": allocation["resume_state_sha256"]}
+    if max_runtime_seconds is not None:
+        extra["max_runtime_seconds"] = max_runtime_seconds
     result = training_fn(dataset_id=dataset_id, config=training_config, **extra)
     if result.get("status") != "completed":
         return {
             "status": "failed",
             "evaluation_split": "validation",
             "error": result.get("message", "Real ML training failed."),
+            "error_type": result.get("error_type"),
             "ml_experiment_id": result.get("experiment_id"),
             "solution_id": result.get("solution_id"),
             "training_seconds": result.get("training_seconds"),
             "log_path": result.get("log_path"),
             "native_resolution": result.get("native_resolution"),
             "effective_resolution": result.get("effective_resolution"),
+            "resumed_from": result.get("resumed_from"),
         }
     with open(result["metrics_path"], encoding="utf-8") as metrics_file:
         history = json.load(metrics_file)
@@ -715,6 +730,13 @@ def execute_registered_training(dataset_id, configuration, seed, training_fn=run
         "stopped_early": result.get("stopped_early", False),
         "stop_reason": result.get("stop_reason"),
         "solution_id": result.get("solution_id"),
+        **({} if allocation is None else {
+            key: result.get(key)
+            for key in ("horizon_epochs", "start_epoch", "completed_through_epoch", "finished",
+                        "finish_reason", "stopped_for_time", "epoch_seconds", "best_epoch",
+                        "checkpoint_sha256", "checkpoint_integrity", "new_best_this_segment",
+                        "training_state", "resumed_from")
+        }),
     }
 
 
@@ -757,6 +779,8 @@ def make_registered_training_tool(
     launch_gate=None,
     autonomy: AutonomyPolicy | None = None,
     search_graph=None,
+    max_gpu_seconds=None,
+    allocator=None,
 ):
     """Create the only production tool that launches campaign GPU training.
 
@@ -765,6 +789,8 @@ def make_registered_training_tool(
     ``launch_gate`` (HITL) can block a valid launch before reservation.
     Scope S1 (``autonomy``) adds ``pipeline``, ``parent_solution_id``, and
     ``change_description``; the default policy (A2/S0) keeps the original tool.
+    With an ``allocator`` (adaptive compute, agent/allocation.py) every launch
+    goes through the allocator's tools, which reuse this same guarded path.
     """
     check_policy(selection_policy)
     policy = autonomy or AutonomyPolicy()
@@ -787,17 +813,20 @@ def make_registered_training_tool(
         campaign_id=campaign_id,
         seed=seed,
         max_experiments=max_experiments,
-        executor=lambda dataset_id, configuration, run_seed: execute_registered_training(
-            dataset_id, configuration, run_seed, training_fn=training_fn,
-            solution_context=solution_context(configuration),
+        executor=lambda dataset_id, configuration, run_seed, **deadline: (
+            execute_registered_training(
+                dataset_id, configuration, run_seed, training_fn=training_fn,
+                solution_context=solution_context(configuration), **deadline,
+            )
         ),
+        max_gpu_seconds=max_gpu_seconds,
     )
 
     def attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
                 weight_decay, pretrained, image_size, early_stopping,
                 early_stopping_patience, early_stopping_min_delta,
                 decision_record=None, pipeline=None, parent_solution_id=None,
-                change_description=None):
+                change_description=None, allocation=None, admit=None):
         identity = {
             "version": version,
             "campaign_id": campaign_id,
@@ -838,7 +867,17 @@ def make_registered_training_tool(
         }
         if pipeline is not None:
             configuration["pipeline"] = pipeline
+        if allocation is not None:
+            configuration["allocation"] = allocation
         identity["configuration"] = configuration
+        if allocator is not None and allocation is None:
+            return reject({
+                "status": "rejected",
+                "error_code": "USE_COMPUTE_ALLOCATION",
+                "message": ("Adaptive compute mode: launch proposed candidates with "
+                            "allocate_compute and continue them with extend_candidate. "
+                            "No budget was used."),
+            })
         out_of_scope = scope_rejection(policy, pipeline)
         if out_of_scope:
             return reject(out_of_scope)
@@ -896,7 +935,7 @@ def make_registered_training_tool(
             if blocked:
                 return reject(blocked)
         response = launch_with_decision(
-            lambda: runner.run(dataset_id, configuration), **identity
+            lambda: runner.run(dataset_id, configuration, admit=admit), **identity
         )
         if launch_gate is not None:
             launch_gate.record_launch(approval, response)
@@ -907,6 +946,20 @@ def make_registered_training_tool(
                 "response": response,
             })
         return response
+
+    if allocator is not None:
+        allocator.bind_launcher(
+            lambda dataset_id, configuration, decision_record, allocation, admit: attempt(
+                dataset_id, configuration["architecture"], configuration["epochs"],
+                configuration["batch_size"], configuration["learning_rate"],
+                configuration["weight_decay"], configuration["pretrained"],
+                configuration["image_size"], configuration["early_stopping"],
+                configuration["early_stopping_patience"],
+                configuration["early_stopping_min_delta"], decision_record,
+                configuration.get("pipeline"), allocation=allocation, admit=admit,
+            ),
+            selection_policy=selection_policy,
+        )
 
     if policy.composes_pipelines:
         return _composable_tool(attempt, selection_policy)

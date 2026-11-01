@@ -140,6 +140,7 @@ def make_search_tools(*, graph: SearchGraph, autonomy: AutonomyPolicy,
                 changes_from_second_parent=changes_from_second_parent,
                 context={"feedback_version": graph.version, "autonomy": autonomy.to_dict(),
                          "proposer": "claude"},
+                configuration={"dataset_id": dataset_id, **configuration},
             )
         except SearchError as exc:
             return exc.to_dict()
