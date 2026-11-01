@@ -9,6 +9,24 @@ Registered datasets:
 - `m-pv4ger`: binary aerial-RGB classification
 - `m-pv4ger-seg`: binary aerial-RGB segmentation
 - `m-chesapeake`: 7-class aerial RGB+NIR segmentation
+- `m-forestnet`: 12-class classification; Landsat-8 Red, Green, Blue, NIR, SWIR1, SWIR2 (uint8, 332x332)
+- `m-brick-kiln`: binary classification; 13 stored channels (64x64)
+- `m-nz-cattle`: binary aerial-RGB segmentation (500x500)
+- `m-cashew-plant`: 7-class segmentation; 12 Sentinel-2 bands plus cloud probability (256x256)
+
+Channels are always selected by verified physical index, never by GEO-Bench's
+stored band names. Per [geo-bench #29 / PR #30](https://github.com/ServiceNow/geo-bench/pull/30),
+`m-brick-kiln` stores `B01 B02 B03 B04 B05 B07 B8A B08 B11 B12 TCI_R TCI_G TCI_B`
+(no B06/B09/B10; the TCI channels are 8-bit true-colour composites) although its
+metadata claims the 13 standard Sentinel-2 bands; `m-eurosat` stores B8A last (#28),
+which the existing SSL4EO reorder already assumed. Each dataset offers explicit input
+views (`rgb`, `multispectral`, `sentinel2_13`, `dataset_channels`); excluded channels
+(brick-kiln TCI in the multispectral view, cashew cloud probability) are documented in
+`ml/registry.py` and recorded in every checkpoint. The four new datasets are
+standardized per channel with statistics from up to 256 evenly spaced training
+samples; the statistics are stored in the checkpoint and reused for final test
+evaluation. The original four datasets keep their fixed scaling and ImageNet
+normalization.
 
 To add another compatible GEO-Bench classification or semantic-segmentation dataset,
 add its verified contract to `ml/registry.py`. The loader, model factory, trainer,
@@ -99,6 +117,182 @@ is claimed, and one campaign per policy is not statistical evidence. Every run t
 from the registry's pretrained weights, because checkpoint resumption is unsupported.
 GPU time is measured and reported but not enforced as a budget.
 
+## Resource accounting
+
+Every `agent.main` campaign (and `agent.compare_policies` trial) records one session per
+agent process in `artifacts/campaigns/resources.jsonl`: provider-reported Bedrock tokens,
+model invocations (Strands event-loop cycles), LLM latency, and elapsed time. Training
+time is read from the existing experiment records (`training_seconds`, else
+`runtime_seconds`; never both). Values that were not reported are `unknown`, never zero.
+Costs need an explicit price file; copy `configs/prices.example.json` and fill it in.
+
+```bash
+python -m research.resource_accounting --campaign-id ID --prices configs/prices.json
+python -m research.resource_accounting --campaign-id ID --json
+```
+
+## Composable pipelines, solutions, and autonomy
+
+`ml/components.py` defines every supported training component with its parameters and
+compatibility constraints: input view and normalization, spatial augmentations
+(`hflip`, `vflip`, `rot90`, `random_resized_crop`; masks move with images), photometric
+augmentations (`brightness`, `contrast`, `gaussian_noise`; one shared factor across all
+channels, so band relationships are preserved), losses (`cross_entropy` with label
+smoothing, `focal`, segmentation-only `dice_cross_entropy`, optional inverse-frequency
+class weights), optimizers (`adamw`, `sgd`), schedulers (`cosine`, `constant`, `step`,
+`warmup_cosine`), and classification-head `dropout`. A `pipeline` object in the training
+config selects them; omitted keys keep the historical defaults (flips, cross-entropy,
+AdamW, cosine), so existing campaigns are unchanged. Incompatible combinations are
+rejected with every reason listed.
+
+```bash
+python -m ml.smoke_test --dataset-id m-cashew-plant --model unet_r34 \
+  --pipeline '{"loss": {"name": "dice_cross_entropy", "class_weighting": "inverse_frequency"}, "augmentations": [{"name": "rot90"}, {"name": "hflip"}]}'
+```
+
+Every training run is recorded against an immutable, content-addressed `SolutionSpec`
+under `artifacts/solutions/<solution_id>/` (`$GOTRAIN_SOLUTIONS_DIR` overrides):
+`spec.json` (dataset contract hash, input channels, normalization policy, model and
+pretrained provenance, pipeline, training settings, seed) and an append-only
+`events.jsonl` with proposals (parent solution, change description, campaign, autonomy)
+and executions (validation results, resources, checkpoint SHA-256, environment, dataset
+fingerprint). `custom_components` binds generated code (scope S2, below) by component ID and
+source SHA-256; it is `[]` for every other pipeline, so Phase 1A solution IDs are unchanged.
+`initialization` is reserved for later warm starts.
+
+Autonomy has two independent axes, separate from P0/P1 and HITL:
+`--authority A2` (default: Claude chooses and launches) or `A1` (launches must first be
+proposed with `propose_solution`), and `--scope S0` (default: existing knobs) or `S1`
+(compose pipeline components via `list_pipeline_components`, a `pipeline` argument,
+`parent_solution_id`/`change_description`, and `inspect_solutions`), or `S2` (S1 plus
+sandboxed generated custom losses; see below). A0 (system decisions) is reserved.
+
+```bash
+python -m agent.main --dataset m-forestnet --feedback E2 --scope S1 --max-experiments 3
+```
+
+## Generated custom losses (scope S2, Phase 1B)
+
+With `--scope S2`, Claude can invent a loss that is not in the catalog: it calls
+`describe_custom_loss_contract`, writes Python source, and submits it with
+`submit_custom_loss`. The code is archived, statically checked, and **executed only inside an
+isolated sandbox** against synthetic data; the structured reply lists every failed check so
+Claude can revise. Only accepted components can be used, via
+`pipeline={"loss": {"name": "custom", "component_id": "cl_..."}}`. S0/S1 reject generated
+components with `SCOPE_NOT_PERMITTED` before any validation or budget use.
+
+Contract `gotrain.custom_loss/1` (`ml/custom_components.py`):
+`compute_loss(logits, targets, *, task, class_weights=None, ignore_index=None, **params)`
+returns a 0-dim tensor differentiable in `logits` (`[N,C]` or `[N,C,H,W]`, float32; targets
+int64). Imports are limited to `torch`, `torch.nn`, `torch.nn.functional`, `math`, `typing`.
+Validation (host-generated inputs, host-computed checks; classification and/or
+segmentation, class weights, ignored targets, batch of one): executes, finite loss and
+gradient, gradient shape, gradient flows to counted targets, **zero gradient at ignored
+targets**, deterministic under a fixed seed, lower loss for correct than random predictions,
+per-call time limit. The sealed test split and real datasets are never used.
+
+Execution architecture (`ml/sandbox.py`, `ml/sandbox_worker.py`): the trainer never imports
+generated code. A `SandboxedLoss` sends logits/labels as raw bytes to a worker and applies the
+gradient it returns (the host never unpickles sandbox output). The worker runs in fresh
+user/mount/net/PID/IPC/UTS namespaces built with util-linux (`unshare`, `pivot_root`,
+`setpriv`, `prlimit`): a tmpfs root with only read-only system libraries, the Python
+environment, `ld.so.cache`, four `/dev` nodes, a 64 MB `/tmp`, read-only `/proc`, and a
+read-only `/work`; no network; empty capability sets and `no_new_privs`; a seccomp filter
+(fork/vfork/non-thread clone, exec, sockets, io_uring, x32 ABI, mount/namespace/ptrace/bpf/
+keyring/module syscalls); RLIMIT_AS (4 GB default), CPU, file size and open-file limits;
+per-request wall-clock timeouts that kill the whole process tree. If the host process is
+root, the sandbox starts as uid 65534 so its namespace-root never maps to host root.
+Before any generated code runs, a trusted probe attempts every escape from inside the
+sandbox; if any succeeds, or the runtime cannot be built (non-Linux, user namespaces
+disabled, missing tools), **execution is refused** (`isolation_unavailable`) — there is no
+fallback. Generated losses only produce the training signal: metrics, splits, checkpoint
+selection and verification, resource accounting and trainer safety controls stay in
+trusted code.
+
+Provenance: components are content-addressed under `artifacts/custom_components/<id>/`
+(`source.py`, `component.json`, append-only `validations.jsonl`); tampering is detected by
+re-hashing. Training re-validates the component in its own sandbox before the first batch
+(so a forged "accepted" record cannot train), copies the exact source into
+`<experiment>/custom_components/`, and records it in the checkpoint, `result.json`, the run
+event and the `SolutionSpec`. Checkpoints reload without the sandbox (the sealed evaluator
+uses its own cross-entropy). Under `--hitl critical`, every launch with a generated
+component triggers a `code_change` consultation that shows the human the exact source and
+needs an approval naming that component; A1 still requires `propose_solution` first.
+
+```bash
+python -m ml.sandbox                                   # verify the isolation runtime (exit 0 = usable)
+python -m ml.custom_components submit loss.py --tasks segmentation --params '{"alpha": 0.3}'
+python -m ml.custom_components list
+python -m ml.custom_components show cl_...
+```
+
+Known limitations (not claimed as guaranteed):
+- Linux-only, and it depends on unprivileged user namespaces; Windows/macOS and most
+  Docker containers with the default seccomp profile (e.g. SageMaker *training jobs*)
+  refuse execution. It is not a VM: a kernel vulnerability reachable through the allowed
+  syscalls (file I/O, mmap, futex, threads) would break it.
+- Read-only exposure: system libraries under `/usr/lib`, `/lib*`, and the Python
+  environment (including other installed packages) are readable; if that environment lives
+  under `$HOME`, listing `$HOME` reveals its directory name. Nothing writable is shared.
+- Resource limits are per worker: RLIMIT_AS, not a cgroup memory limit; CPU is bounded by
+  RLIMIT_CPU and request timeouts, not a cgroup quota; threads (up to `RLIMIT_NPROC`) are allowed.
+- The loss value reported as `val_loss` comes from the generated code; validation metrics do not.
+- Every loss call crosses a process boundary (CPU copy of logits and gradient), which slows
+  training, especially for large segmentation batches.
+
+### SageMaker verification
+
+Run from the repository root on the notebook instance (no Bedrock calls in steps 1-2):
+
+```bash
+# 1. CPU-only isolation tests (no GPU, no dataset, no AWS calls)
+python -m ml.sandbox
+CUDA_VISIBLE_DEVICES="" python -m pytest -q tests/test_custom_components.py tests/test_sandbox_linux.py
+python -m pytest -q tests/
+
+# 2. One-batch GPU checks on real data with the two generated demo losses
+python -c "import sys; sys.path.insert(0, 'tests'); import generated_losses as g; open('/tmp/poly1.py', 'w').write(g.POLY1); open('/tmp/tversky.py', 'w').write(g.TVERSKY)"
+python -m ml.custom_components submit /tmp/poly1.py --tasks classification segmentation --params '{"epsilon": 1.0}' --name poly1      # cl_e4f04209a6f106d91b2d
+python -m ml.custom_components submit /tmp/tversky.py --tasks segmentation --params '{"alpha": 0.3, "beta": 0.7, "mix": 0.5}' --name tversky  # cl_c2aef2f77f6a85970a68
+python -m ml.smoke_test --dataset-id m-eurosat --model resnet18_rgb --pipeline '{"loss": {"name": "custom", "component_id": "cl_e4f04209a6f106d91b2d"}}'
+python -m ml.smoke_test --dataset-id m-cashew-plant --model unet_r34 --pipeline '{"loss": {"name": "custom", "component_id": "cl_c2aef2f77f6a85970a68", "class_weighting": "inverse_frequency"}}'
+python -m pytest -q tests/test_sandbox_linux.py -k cuda
+
+# 3. Optional, paid (Bedrock + GPU): Claude writes, validates, and trains its own loss
+python -m agent.main --mode campaign --dataset m-cashew-plant --feedback E3 --scope S2 --max-experiments 3
+python -m agent.main --mode campaign --dataset m-cashew-plant --feedback E3 --scope S2 --authority A1 --hitl critical --max-experiments 3
+```
+
+## Human-in-the-loop (`--hitl`)
+
+- `off` (default): fully autonomous; agent, prompt, and tools are unchanged.
+- `always`: before every training run Claude calls `request_human_consultation` with the
+  evidence, options (with exact configurations and measured-cost estimates), and its
+  recommendation. The human picks an option, delegates back to Claude, or stops.
+- `critical`: autonomous, but approval is required after `--hitl-failure-threshold`
+  consecutive failed runs, or when a run's measured-cost estimate exceeds
+  `--hitl-cost-threshold-usd`. Claude must consult before proposing code changes and may
+  consult when evidence is insufficient.
+
+With a cost threshold, a run whose cost cannot be estimated from measured runs of the
+same model asks the human by default (`--hitl-unknown-cost allow` opts out).
+
+The training tool checks approval before reservation, so blocked launches use no budget.
+A selected configuration must be launched exactly. A consultation raises a Strands
+interrupt: the agent loop stops (HITL agents run tools sequentially), the conversation
+and interrupt are saved by Strands' `FileSessionManager`, and no training job is running.
+By default the process exits; the human answers by request number and the campaign
+resumes once. `--hitl-interactive` instead asks on the terminal between agent calls.
+
+```bash
+python -m agent.main --hitl always --dataset m-pv4ger --feedback E2 --max-experiments 4 --campaign-id demo1
+python -m agent.hitl show --campaign-id demo1
+python -m agent.hitl respond --campaign-id demo1 --request-id 1 --choice A --note "keep native resolution"
+python -m agent.main --resume --campaign-id demo1
+python -m agent.main --hitl critical --dataset m-chesapeake --hitl-cost-threshold-usd 2 --prices configs/prices.json
+python -m agent.main --hitl always --hitl-interactive --dataset m-pv4ger
+```
+
 Run the Phase-A one-batch GPU checks before adding model architectures:
 
 ```bash
@@ -150,6 +344,14 @@ Target configurations:
 - `resnet50_s2`: SSL4EO-S12 `B13_rn50_dino_0099.pth`
 - `unet_r34`: SMP U-Net with pinned ResNet-34 ImageNet encoder provenance
 - `deeplabv3plus_r50`: SMP DeepLabV3+ with pinned ResNet-50 ImageNet encoder provenance
+- `resnet18_ms`, `resnet50_ms`: TorchVision ImageNet ResNets for multispectral views
+
+Compatibility is a capability rule, not a dataset list: a model is offered when its
+task type matches and the dataset declares the input view it consumes. When a model
+takes more than three channels, its pretrained RGB filters are placed on the channels
+verified as red/green/blue and every other channel starts from the mean pretrained RGB
+filter (documented adaptation, never random). U-Net and DeepLabV3+ pad inputs to a
+multiple of 32 and crop outputs back, so `m-nz-cattle` trains at native 500x500.
 
 The existing `fcn_resnet50` implementation is retained as a legacy segmentation
 baseline but is not presented as one of the requested target configurations.

@@ -1,21 +1,15 @@
 import json
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 try:
-    import strands  # noqa: F401
-except ImportError:  # Local machines without Strands: tools become plain functions.
-    stub = types.ModuleType("strands")
-    stub.tool = lambda function: function
-    stub.Agent = object
-    stub.models = types.ModuleType("strands.models")
-    stub.models.BedrockModel = object
-    sys.modules["strands"] = stub
-    sys.modules["strands.models"] = stub.models
+    import strands_stub
+except ImportError:  # run as tests.<module> from the repo root
+    from tests import strands_stub
+
+strands_stub.install()  # no-op when strands-agents is installed
 
 from agent import tools
 from agent.experiments import FEEDBACK_VERSIONS, get_budget_status, load_campaign_experiments
@@ -45,7 +39,7 @@ class FakeTrainer:
         self.directory = Path(directory)
         self.calls = []
 
-    def __call__(self, *, dataset_id, config):
+    def __call__(self, *, dataset_id, config, **solution_context):
         self.calls.append((dataset_id, config))
         score = {0.0003: 0.71, 0.001: 0.72}[config["learning_rate"]]
         metrics = self.directory / f"metrics_{len(self.calls)}.json"

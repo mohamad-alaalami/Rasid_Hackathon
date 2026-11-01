@@ -22,9 +22,12 @@ except ImportError:
 
 
 def fake_bundle(dataset_id, config):
+    from ml.dataset import DataBundle
+
     generator = torch.Generator().manual_seed(0)
     batch = [(torch.randn(4, 3, 64, 64, generator=generator), torch.tensor([0, 1, 2, 3]))]
-    return SimpleNamespace(
+    # A real DataBundle, so the fake fails loudly if the loader contract changes.
+    return DataBundle(
         train_loader=batch,
         val_loader=batch,
         task_type="classification",
@@ -40,6 +43,8 @@ def fake_bundle(dataset_id, config):
             "normalization": "imagenet_rgb",
             "effective_resolution": [64, 64],
         },
+        rgb_positions=(0, 1, 2),  # B04, B03, B02 in the selected RGB view
+        pipeline=config.resolved_pipeline(),
     )
 
 
@@ -69,6 +74,7 @@ class StoreTrainingIntegrationTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {
             "GOTRAIN_STORE": str(self.store_dir),
             "GOTRAIN_CACHE_DIR": str(root / "cache"),
+            "GOTRAIN_SOLUTIONS_DIR": str(root / "solutions"),
         })
         self.environment.start()
         self.config = {
