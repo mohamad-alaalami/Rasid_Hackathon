@@ -41,7 +41,9 @@ exactly these four nonempty string fields:
 
 Executable actions are limited to what run_campaign_experiment supports: a new
 run with an eligible model_id, epochs (1-20), batch_size (within the model
-limit), learning_rate, weight_decay, pretrained, and an optional image_size.
+limit), learning_rate, weight_decay, pretrained, an optional image_size, and
+optional validation-based early stopping (early_stopping, early_stopping_patience,
+early_stopping_min_delta), in which case epochs is the maximum.
 Every run starts from the registry's pretrained initialization; resuming or
 warm-starting from an earlier campaign checkpoint is NOT supported, so "train
 longer" means a new run with more epochs. A malformed decision_record is
@@ -221,7 +223,8 @@ def build_decision_trace(version, campaign_id, seed):
                 for key in (
                     "status", "validation_score", "primary_metric", "runtime_seconds",
                     "training_seconds", "peak_gpu_memory_mb", "device",
-                    "checkpoint_path", "error",
+                    "requested_epochs", "completed_epochs", "stopped_early",
+                    "stop_reason", "checkpoint_path", "error",
                 )
             }
         incumbent_score = entry["context_at_decision"]["incumbent_validation_score"]

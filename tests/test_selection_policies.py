@@ -228,6 +228,18 @@ class SelectionPolicyTests(unittest.TestCase):
             # Same configuration, same profile: P1 receives exactly P0's observations.
             self.assertEqual(feedback["P0"], feedback["P1"], version)
 
+    def test_early_stopping_reaches_trainer_under_both_policies(self):
+        options = {"early_stopping": True, "early_stopping_patience": 2,
+                   "early_stopping_min_delta": 0.001}
+        self.tool("P0", "c0")(**run_args(), **options)
+        self.tool("P1", "c1")(decision_record=DECISION, **run_args(), **options)
+        for _, config in self.trainer.calls:
+            self.assertEqual({key: config[key] for key in options}, options)
+        bad = self.tool("P1", "c2")(decision_record=DECISION, **run_args(),
+                                    early_stopping=True, early_stopping_patience=0)
+        self.assertEqual(bad["error_code"], "INVALID_MODEL_CONFIGURATION")
+        self.assertEqual(len(self.trainer.calls), 2)
+
     def test_validator_normalizes_whitespace(self):
         record, error = validate_decision_record({key: f"  {value} " for key, value in DECISION.items()})
         self.assertIsNone(error)

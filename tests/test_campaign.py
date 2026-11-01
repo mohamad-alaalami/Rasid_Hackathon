@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from agent.campaign import CampaignRunner
 from agent.experiments import load_campaign_experiments
+from agent.feedback import build_campaign_report
 
 
 def configuration(model="resnet18_rgb", learning_rate=0.0003):
@@ -114,6 +115,77 @@ class CampaignRunnerTests(unittest.TestCase):
         self.assertEqual(
             e3["detailed_diagnostics_available"], ["learning_rate_history"]
         )
+
+    def test_campaign_report_respects_feedback_isolation(self):
+        forbidden_curves = {
+            "train_loss", "val_loss", "validation_metric_curve",
+            "detailed_diagnostics",
+        }
+
+        for version in ("E0", "E1", "E2", "E3"):
+            with self.subTest(version=version):
+                records = [
+                    {
+                        "experiment_id": 1,
+                        "dataset": "m-eurosat",
+                        "configuration": configuration(),
+                        "status": "completed",
+                        "primary_metric": "accuracy",
+                        "validation_score": 0.7,
+                        "train_loss": [1.0, 0.5],
+                        "val_loss": [0.9, 0.6],
+                        "validation_metric_curve": [0.6, 0.7],
+                        "detailed_diagnostics": {
+                            "learning_rate_history": [0.0003, 0.0003]
+                        },
+                    },
+                    {
+                        "experiment_id": 2,
+                        "dataset": "m-eurosat",
+                        "configuration": configuration(learning_rate=0.001),
+                        "status": "completed",
+                        "primary_metric": "accuracy",
+                        "validation_score": 0.8,
+                        "train_loss": [0.8, 0.4],
+                        "val_loss": [0.7, 0.5],
+                        "validation_metric_curve": [0.7, 0.8],
+                        "detailed_diagnostics": {
+                            "learning_rate_history": [0.001, 0.001]
+                        },
+                    },
+                ]
+                report = build_campaign_report(
+                    version, "campaign-1", records, records[-1]
+                )
+                experiment = report["experiments"][-1]
+
+                self.assertTrue(forbidden_curves.isdisjoint(experiment))
+                if version == "E0":
+                    self.assertNotIn("training_diagnostics", experiment)
+                    self.assertNotIn(
+                        "detailed_diagnostics_available", experiment
+                    )
+                else:
+                    self.assertIn("training_diagnostics", experiment)
+
+                if version in {"E0", "E1"}:
+                    self.assertEqual(len(report["experiments"]), 1)
+                    self.assertNotIn("best_validation_score", report)
+                    self.assertNotIn("completed", report)
+                else:
+                    self.assertEqual(len(report["experiments"]), 2)
+                    self.assertEqual(report["best_validation_score"], 0.8)
+                    self.assertEqual(report["completed"], 2)
+
+                if version == "E3":
+                    self.assertEqual(
+                        experiment["detailed_diagnostics_available"],
+                        ["learning_rate_history"],
+                    )
+                else:
+                    self.assertNotIn(
+                        "detailed_diagnostics_available", experiment
+                    )
 
 
 if __name__ == "__main__":

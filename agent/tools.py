@@ -6,7 +6,7 @@ import time
 import torch
 from strands import tool
 
-from agent.feedback import build_feedback
+from agent.feedback import build_campaign_report, build_feedback
 from agent.campaign import CampaignRunner
 from agent.policies import (
     DEFAULT_POLICY,
@@ -561,6 +561,13 @@ def _make_dataset_training_tool(
             "weight_decay": configuration.get("weight_decay", 0.0001),
             "pretrained": configuration.get("pretrained", True),
             "image_size": configuration.get("image_size"),
+            "early_stopping": configuration.get("early_stopping", False),
+            "early_stopping_patience": configuration.get(
+                "early_stopping_patience", 3
+            ),
+            "early_stopping_min_delta": configuration.get(
+                "early_stopping_min_delta", 0.0
+            ),
             "seed": seed,
             "device": "auto",
             "mixed_precision": True,
@@ -588,6 +595,12 @@ def _make_dataset_training_tool(
             "native_resolution": result["native_resolution"],
             "effective_resolution": result["effective_resolution"],
             "primary_metric": dataset_spec["primary_metric"],
+            "requested_epochs": result.get(
+                "requested_epochs", configuration["epochs"]
+            ),
+            "completed_epochs": result.get("completed_epochs", len(history)),
+            "stopped_early": result.get("stopped_early", False),
+            "stop_reason": result.get("stop_reason"),
         }
 
     return make_training_tool(
@@ -623,6 +636,11 @@ def execute_registered_training(dataset_id, configuration, seed, training_fn=run
         "weight_decay": configuration.get("weight_decay", 0.0001),
         "pretrained": configuration.get("pretrained", True),
         "image_size": configuration.get("image_size"),
+        "early_stopping": configuration.get("early_stopping", False),
+        "early_stopping_patience": configuration.get("early_stopping_patience", 3),
+        "early_stopping_min_delta": configuration.get(
+            "early_stopping_min_delta", 0.0
+        ),
         "seed": seed,
         "device": "auto",
         "mixed_precision": True,
@@ -662,6 +680,12 @@ def execute_registered_training(dataset_id, configuration, seed, training_fn=run
         "training_seconds": result["training_seconds"],
         "peak_gpu_memory_mb": result.get("peak_gpu_memory_mb"),
         "device": result["device"],
+        "requested_epochs": result.get(
+            "requested_epochs", configuration["epochs"]
+        ),
+        "completed_epochs": result.get("completed_epochs", len(history)),
+        "stopped_early": result.get("stopped_early", False),
+        "stop_reason": result.get("stop_reason"),
     }
 
 
@@ -693,7 +717,9 @@ def make_registered_training_tool(
     )
 
     def attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
-                weight_decay, pretrained, image_size, decision_record=None):
+                weight_decay, pretrained, image_size, early_stopping,
+                early_stopping_patience, early_stopping_min_delta,
+                decision_record=None):
         identity = {
             "version": version,
             "campaign_id": campaign_id,
@@ -728,6 +754,9 @@ def make_registered_training_tool(
             "weight_decay": weight_decay,
             "pretrained": pretrained,
             "image_size": image_size,
+            "early_stopping": early_stopping,
+            "early_stopping_patience": early_stopping_patience,
+            "early_stopping_min_delta": early_stopping_min_delta,
         }
         identity["configuration"] = configuration
         mismatch = check_campaign_policy(campaign_id, seed, selection_policy)
@@ -747,6 +776,10 @@ def make_registered_training_tool(
                 raise ValueError("learning_rate must be positive and weight_decay nonnegative.")
             if image_size is not None and image_size < 32:
                 raise ValueError("image_size must be at least 32 when explicitly set.")
+            if early_stopping_patience < 1:
+                raise ValueError("early_stopping_patience must be at least 1.")
+            if early_stopping_min_delta < 0:
+                raise ValueError("early_stopping_min_delta cannot be negative.")
             selected_model = validate_model_for_dataset(model_id, dataset_id)
             model_spec = get_model_spec(selected_model)
             runtime = model_runtime_status(selected_model)
@@ -785,10 +818,14 @@ def make_registered_training_tool(
             weight_decay: float = 0.0001,
             pretrained: bool = True,
             image_size: int | None = None,
+            early_stopping: bool = False,
+            early_stopping_patience: int = 3,
+            early_stopping_min_delta: float = 0.0,
         ) -> dict:
             """Run one real train/validation experiment within the campaign budget."""
             return attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
-                           weight_decay, pretrained, image_size)
+                           weight_decay, pretrained, image_size, early_stopping,
+                           early_stopping_patience, early_stopping_min_delta)
 
         return run_campaign_experiment
 
@@ -803,6 +840,9 @@ def make_registered_training_tool(
         weight_decay: float = 0.0001,
         pretrained: bool = True,
         image_size: int | None = None,
+        early_stopping: bool = False,
+        early_stopping_patience: int = 3,
+        early_stopping_min_delta: float = 0.0,
     ) -> dict:
         """Run one real train/validation experiment within the campaign budget.
 
@@ -819,9 +859,15 @@ def make_registered_training_tool(
             weight_decay: Nonnegative weight decay.
             pretrained: Use the registry's verified pretrained weights.
             image_size: Optional square resize; native resolution when omitted.
+            early_stopping: Stop when the primary validation metric stalls;
+                epochs then becomes the maximum.
+            early_stopping_patience: Epochs without improvement before stopping (>=1).
+            early_stopping_min_delta: Minimum improvement that resets patience (>=0).
         """
         return attempt(dataset_id, model_id, epochs, batch_size, learning_rate,
-                       weight_decay, pretrained, image_size, decision_record)
+                       weight_decay, pretrained, image_size, early_stopping,
+                       early_stopping_patience, early_stopping_min_delta,
+                       decision_record)
 
     return run_campaign_experiment
 
@@ -885,21 +931,11 @@ def make_campaign_diagnostics_tool(version: str, campaign_id: str, seed: int):
 def make_campaign_report_tool(version: str, campaign_id: str, seed: int):
     @tool
     def get_campaign_report() -> dict:
-        """Return every factual campaign result and the best real checkpoint."""
+        """Return mode-filtered factual results and the best real checkpoint."""
         records = load_campaign_experiments(version, campaign_id, seed)
         datasets = sorted({run["dataset"] for run in records})
         best = None
         if len(datasets) == 1:
             best = get_best_experiment(version, campaign_id, datasets[0], seed)
-        return {
-            "campaign_id": campaign_id,
-            "feedback_version": version,
-            "dataset_id": datasets[0] if len(datasets) == 1 else None,
-            "experiments": records,
-            "best_experiment_id": best.get("experiment_id") if best else None,
-            "best_validation_score": best.get("validation_score") if best else None,
-            "best_checkpoint_path": best.get("checkpoint_path") if best else None,
-            "completed": sum(run["status"] == "completed" for run in records),
-            "failed": sum(run["status"] == "failed" for run in records),
-        }
+        return build_campaign_report(version, campaign_id, records, best)
     return get_campaign_report

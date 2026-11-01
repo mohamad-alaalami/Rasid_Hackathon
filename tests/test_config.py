@@ -35,6 +35,22 @@ class TrainingConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "epochs has invalid type"):
             TrainingConfig.from_mapping({"epochs": True})
 
+    def test_early_stopping_configuration(self):
+        config = TrainingConfig.from_mapping({
+            "early_stopping": True,
+            "early_stopping_patience": 2,
+            "early_stopping_min_delta": 0.001,
+        })
+        self.assertTrue(config.early_stopping)
+        self.assertEqual(config.early_stopping_patience, 2)
+        self.assertEqual(config.early_stopping_min_delta, 0.001)
+
+    def test_invalid_early_stopping_values_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "patience"):
+            TrainingConfig.from_mapping({"early_stopping_patience": 0})
+        with self.assertRaisesRegex(ValueError, "min_delta"):
+            TrainingConfig.from_mapping({"early_stopping_min_delta": -0.1})
+
 
 if __name__ == "__main__":
     unittest.main()

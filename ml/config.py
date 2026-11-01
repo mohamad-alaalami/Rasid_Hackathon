@@ -28,6 +28,11 @@ class TrainingConfig:
     # None preserves the dataset's verified native resolution. Set an integer
     # only for an intentional square resize experiment.
     image_size: int | None = None
+    # Disabled by default to preserve existing experiment behavior. When
+    # enabled, epochs remains the maximum rather than a guaranteed count.
+    early_stopping: bool = False
+    early_stopping_patience: int = 3
+    early_stopping_min_delta: float = 0.0
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "TrainingConfig":
@@ -51,6 +56,9 @@ class TrainingConfig:
             "checkpoint_dir": str,
             "pretrained_checkpoint": (str, type(None)),
             "image_size": (int, type(None)),
+            "early_stopping": bool,
+            "early_stopping_patience": int,
+            "early_stopping_min_delta": Real,
         }
         for name, value in raw.items():
             expected = expected_types[name]
@@ -62,6 +70,8 @@ class TrainingConfig:
                 "seed",
                 "num_workers",
                 "image_size",
+                "early_stopping_patience",
+                "early_stopping_min_delta",
             }
             if not isinstance(value, expected) or (
                 name in numeric_fields and isinstance(value, bool)
@@ -91,6 +101,10 @@ class TrainingConfig:
             raise ValueError("num_workers cannot be negative.")
         if self.image_size is not None and self.image_size < 32:
             raise ValueError("image_size must be at least 32.")
+        if self.early_stopping_patience < 1:
+            raise ValueError("early_stopping_patience must be at least 1.")
+        if self.early_stopping_min_delta < 0:
+            raise ValueError("early_stopping_min_delta cannot be negative.")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be 'auto', 'cpu', or 'cuda'.")
         if self.benchmark_dir is not None and not Path(self.benchmark_dir).is_dir():

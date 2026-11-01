@@ -11,6 +11,7 @@ from strands.models import BedrockModel
 from agent.experiments import create_campaign_id, get_best_experiment, load_campaign_experiments
 from agent.policies import SELECTION_POLICIES, build_decision_trace, build_system_prompt
 from agent.prompts import SYSTEM_PROMPT
+from agent.store_tools import make_store_tools, store_campaign_instructions
 from agent.tools import (
     agent_capabilities,
     inspect_dataset,
@@ -50,6 +51,7 @@ def create_campaign_agent(args, campaign_id: str) -> Agent:
         tools.append(make_campaign_history_tool(args.feedback, campaign_id, args.seed))
     if args.feedback == "E3":
         tools.append(make_campaign_diagnostics_tool(args.feedback, campaign_id, args.seed))
+    tools.extend(make_store_tools(args.feedback))
     return Agent(
         model=_bedrock_model(args.model_id, args.region),
         system_prompt=build_system_prompt(args.policy),
@@ -79,7 +81,7 @@ checkpoint, and the best validation checkpoint.
 
 Never access a test split. Never invent or estimate missing results. A failed run is
 recorded as failed and is not evidence of model quality.
-"""
+""" + store_campaign_instructions(args.feedback)
 
 
 def run_campaign(args) -> str:
