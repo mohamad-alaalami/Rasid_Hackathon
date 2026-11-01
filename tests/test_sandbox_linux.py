@@ -370,5 +370,69 @@ class TrainingTests(_StoreCase):
                          submitted["component_id"])
 
 
+
+X32_PROBE = r'''
+import ctypes, json
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+RESULTS = {}
+for name, number, argument in (("getpid", 39, 0), ("socket", 41, 2), ("fork", 57, 0),
+                               ("unshare", 272, 0x10000000), ("execve_x32", 520, 0),
+                               ("mount", 165, 0)):
+    ctypes.set_errno(0)
+    rc = libc.syscall(ctypes.c_long(number | 0x40000000), ctypes.c_long(argument),
+                      ctypes.c_long(1), 0, 0, 0, 0)
+    RESULTS[name] = [rc, ctypes.get_errno()]
+
+
+def compute_loss(logits, targets, *, task, class_weights=None, ignore_index=None):
+    raise RuntimeError("X32=" + json.dumps(RESULTS))
+'''
+
+
+@unittest.skipUnless(AVAILABLE and __import__("platform").machine() == "x86_64",
+                     f"x86_64 isolation runtime unavailable: {REASON}")
+class X32AbiTests(unittest.TestCase):
+    """Regression: x32-ABI syscalls (nr | 0x40000000) must not bypass the filter.
+
+    They report the x86_64 audit arch, so the architecture check alone does not
+    stop them, and kernels built with CONFIG_X86_X32_ABI execute them.
+    """
+
+    def test_x32_syscalls_are_rejected_by_the_filter(self):
+        with sandbox.SandboxSession({"component.py": X32_PROBE, "params.json": "{}"}) as session:
+            self.assertEqual(session.self_check["status"], "ready")
+            self.assertEqual(session.self_check["seccomp"]["x32_abi"], "denied")
+            session.request({"op": "load"}, timeout=60, expect=[])
+            with self.assertRaises(sandbox.SandboxError) as raised:
+                cc.remote_loss(session, torch.randn(2, 3), torch.tensor([0, 1]),
+                               task="classification")
+        text = str(raised.exception)
+        results = json.loads(text[text.index("X32=") + 4:])
+        for name, (rc, errno_value) in results.items():
+            self.assertEqual((rc, errno_value), (-1, 1), f"x32 {name} was not rejected with EPERM")
+
+
+@unittest.skipUnless(AVAILABLE, f"isolation runtime unavailable: {REASON}")
+class SessionSelfCheckTests(unittest.TestCase):
+    def test_every_session_passes_the_self_check_before_use(self):
+        with sandbox.SandboxSession() as session:
+            self.assertEqual(session.self_check["status"], "ready")
+
+    def test_a_failing_self_check_refuses_the_session(self):
+        import subprocess
+
+        real_popen = subprocess.Popen
+
+        def popen_with_secret(*args, **kwargs):
+            if "env" in kwargs and kwargs["env"] is not None:  # only the sandbox launch
+                kwargs["env"] = {**kwargs["env"], "AWS_SECRET_ACCESS_KEY": "leak"}
+            return real_popen(*args, **kwargs)
+        with patch.object(sandbox.subprocess, "Popen", popen_with_secret):
+            with self.assertRaises(sandbox.SandboxError) as raised:
+                sandbox.SandboxSession()
+        self.assertEqual(raised.exception.error_type, "SANDBOX_SELF_CHECK")
+        self.assertIn("AWS_SECRET_ACCESS_KEY", str(raised.exception))
+
 if __name__ == "__main__":
     unittest.main()

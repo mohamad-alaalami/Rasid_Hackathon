@@ -340,6 +340,17 @@ class SandboxSession:
         # Drain stderr continuously so a chatty worker cannot block on a full pipe.
         self._stderr_thread = threading.Thread(target=self._collect_stderr, daemon=True)
         self._stderr_thread.start()
+        # Every session must pass the worker's own isolation self-check before use.
+        try:
+            ready = self._read_reply(time.monotonic() + self.limits.startup_timeout, None)
+        except BaseException:
+            self.close()
+            raise
+        if ready.get("status") != "ready":
+            self.close()
+            raise SandboxError(ready.get("error_type", "SANDBOX_SELF_CHECK"),
+                               f"sandbox failed its self-check: {ready.get('message')}")
+        self.self_check = ready
 
     def _collect_stderr(self):
         stream = self.process.stderr
@@ -379,6 +390,23 @@ class SandboxSession:
                                     "stderr_tail": self.stderr_tail()})
             data += chunk
         return data
+
+    def _read_reply(self, deadline, expect):
+        """Read one header-only frame (the startup handshake)."""
+        try:
+            (length,) = struct.unpack(">I", self._read_exact(4, deadline))
+            if length > MAX_HEADER:
+                raise SandboxError("SANDBOX_PROTOCOL", "handshake header too large")
+            reply = json.loads(self._read_exact(length, deadline))
+            if not isinstance(reply, dict) or reply.get("buffers"):
+                raise SandboxError("SANDBOX_PROTOCOL", "malformed handshake")
+            return reply
+        except SandboxError:
+            self.kill()
+            raise
+        except (ValueError, TypeError, struct.error) as exc:
+            self.kill()
+            raise SandboxError("SANDBOX_PROTOCOL", f"malformed handshake: {exc}") from exc
 
     def request(self, header, buffers=(), timeout=None, expect=None):
         """Send one request; validate reply sizes against ``expect`` (list of byte counts)."""

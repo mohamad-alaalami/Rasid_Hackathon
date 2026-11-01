@@ -21,14 +21,18 @@ import traceback
 
 MAX_HEADER = 1 << 20
 
-# Keep the protocol on private descriptors so prints from generated code
-# (fd 1) cannot corrupt it; they go to stderr instead.
-_PROTO_IN = os.fdopen(os.dup(0), "rb", buffering=0)
-_PROTO_OUT = os.fdopen(os.dup(1), "wb", buffering=0)
-os.dup2(2, 1)
-_devnull = os.open(os.devnull, os.O_RDONLY) if os.path.exists(os.devnull) else None
-if _devnull is not None:
-    os.dup2(_devnull, 0)
+_PROTO_IN = _PROTO_OUT = None
+
+
+def _init_channel():
+    """Keep the protocol on private descriptors so prints from generated code
+    (fd 1) cannot corrupt it; they go to stderr instead."""
+    global _PROTO_IN, _PROTO_OUT
+    _PROTO_IN = os.fdopen(os.dup(0), "rb", buffering=0)
+    _PROTO_OUT = os.fdopen(os.dup(1), "wb", buffering=0)
+    os.dup2(2, 1)
+    if os.path.exists(os.devnull):
+        os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
 
 
 def _read_exact(count):
@@ -98,13 +102,15 @@ SYSCALLS = {
 }
 
 
-def install_seccomp():
-    import ctypes
-    import platform
+SECCOMP_ALLOW, SECCOMP_KILL = 0x7FFF0000, 0x80000000
+SECCOMP_EPERM, SECCOMP_ENOSYS = 0x00050000 | 1, 0x00050000 | 38
 
-    table = SYSCALLS.get(platform.machine())
+
+def build_seccomp_program(machine):
+    """Classic-BPF seccomp program as (code, jt, jf, k) tuples for ``machine``."""
+    table = SYSCALLS.get(machine)
     if table is None:
-        raise RuntimeError(f"no seccomp policy for architecture {platform.machine()!r}")
+        raise RuntimeError(f"no seccomp policy for architecture {machine!r}")
     load, jeq, jge, jset, ret = 0x20, 0x15, 0x35, 0x45, 0x06
     allow, kill = 0x7FFF0000, 0x80000000
     eperm, enosys = 0x00050000 | 1, 0x00050000 | 38
@@ -117,6 +123,14 @@ def install_seccomp():
         program += [(jeq, 0, 1, number), (ret, 0, 0, eperm)]
     program += [(jeq, 0, 4, table["clone"]), (load, 0, 0, 16), (jset, 0, 1, 0x00010000),
                 (ret, 0, 0, allow), (ret, 0, 0, eperm), (ret, 0, 0, allow)]
+    return program, table
+
+
+def install_seccomp():
+    import ctypes
+    import platform
+
+    program, table = build_seccomp_program(platform.machine())
 
     class Filter(ctypes.Structure):
         _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte), ("jf", ctypes.c_ubyte),
@@ -135,6 +149,54 @@ def install_seccomp():
     return {"architecture": platform.machine(), "denied": sorted(table["deny"]),
             "clone": "threads only", "clone3": "ENOSYS",
             "x32_abi": "denied" if table["x32_bit"] else "n/a"}
+
+
+# ---------------------------------------------------------------------------
+# Per-session self-check: every sandbox (not just the cached probe) must show
+# the isolation properties before it serves a single request.
+# ---------------------------------------------------------------------------
+
+ALLOWED_ENVIRONMENT = {"PATH", "HOME", "LANG", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                       "GOTRAIN_SANDBOX_THREADS", "PYTHONHASHSEED", "PWD", "OLDPWD", "SHLVL", "_"}
+WRITABLE_MOUNTS = ("/tmp",)
+DEVICE_MOUNTS = ("/dev/null", "/dev/zero", "/dev/urandom", "/dev/random")
+
+
+def self_check_failures(status_text, mountinfo_text, uid_map_text, environment):
+    """Pure check of /proc/self/status, /proc/self/mountinfo, uid_map, and env."""
+    failures = []
+    fields = dict(line.split(":", 1) for line in status_text.splitlines() if ":" in line)
+    if fields.get("Seccomp", "").strip() != "2":
+        failures.append(f"seccomp mode {fields.get('Seccomp', '?').strip()} != 2 (filter)")
+    if fields.get("NoNewPrivs", "").strip() != "1":
+        failures.append("no_new_privs not set")
+    for name in ("CapEff", "CapPrm", "CapAmb"):
+        if int(fields.get(name, "1").strip() or "1", 16) != 0:
+            failures.append(f"{name} is not empty")
+    parts = uid_map_text.split()
+    if len(parts) < 2 or parts[1] == "0":
+        failures.append(f"uid map {parts!r} maps to host root or is missing")
+    for line in mountinfo_text.splitlines():
+        fields_ = line.split()
+        if len(fields_) < 6:
+            continue
+        point, options = fields_[4], fields_[5].split(",")
+        if point in WRITABLE_MOUNTS or point in DEVICE_MOUNTS:
+            continue
+        if "ro" not in options:
+            failures.append(f"mount {point} is writable")
+    unexpected = sorted(set(environment) - ALLOWED_ENVIRONMENT)
+    if unexpected:
+        failures.append(f"unexpected environment variables {unexpected}")
+    return failures
+
+
+def self_check():
+    def read(path):
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    return self_check_failures(read("/proc/self/status"), read("/proc/self/mountinfo"),
+                               read("/proc/self/uid_map"), dict(os.environ))
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +350,7 @@ _SECCOMP = None
 
 def main():
     global _SECCOMP
+    _init_channel()
     try:
         _SECCOMP = install_seccomp()
     except Exception as exc:  # fail closed: never serve requests without the filter
@@ -301,6 +364,15 @@ def main():
     except Exception as exc:  # torch unusable inside the sandbox
         send(_error("SANDBOX_RUNTIME", exc))
         return
+    try:
+        failures = self_check()
+    except Exception as exc:  # cannot verify: fail closed
+        failures = [f"self-check could not run: {type(exc).__name__}: {exc}"]
+    if failures:
+        send({"status": "error", "error_type": "SANDBOX_SELF_CHECK",
+              "message": "; ".join(failures)})
+        return
+    send({"status": "ready", "seccomp": _SECCOMP})
     loaded = None
     while True:
         try:
