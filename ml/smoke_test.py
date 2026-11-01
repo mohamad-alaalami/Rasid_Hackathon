@@ -28,7 +28,7 @@ def run_smoke_test(
 
     from .dataset import create_dataloaders
     from .evaluate import evaluate_model
-    from .components import build_training_components
+    from .components import build_training_components, close_criterion
     from .models import apply_head_dropout, create_model, model_logits, validate_model_output_shape
     from .model_registry import get_model_spec
 
@@ -73,7 +73,7 @@ def run_smoke_test(
     criterion, optimizer, _ = build_training_components(
         data.pipeline, model, num_classes=data.num_classes, ignore_index=data.ignore_index,
         class_counts=data.class_counts, learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay, epochs=1, device=device,
+        weight_decay=config.weight_decay, epochs=1, device=device, task_type=data.task_type,
     )
 
     train_images, train_targets = next(iter(data.train_loader))
@@ -149,7 +149,10 @@ def run_smoke_test(
         "peak_gpu_memory_mb": peak_memory_mb,
         "checkpoint_reload_verified": True,
         "test_split_accessed": False,
+        "custom_loss": getattr(criterion, "component_id", None),
+        "custom_loss_source_sha256": getattr(criterion, "source_sha256", None),
     }
+    close_criterion(criterion)
     return result
 
 

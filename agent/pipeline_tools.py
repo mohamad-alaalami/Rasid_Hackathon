@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from strands import tool
 
-from agent.autonomy import AutonomyPolicy
+from agent.autonomy import AutonomyPolicy, scope_rejection
 from agent.experiments import load_campaign_experiments
 from agent.tools import campaign_solution, check_run_arguments
 from ml.components import PipelineError, describe_configuration_space
@@ -37,6 +37,7 @@ def _summary(sid, campaign_id, detail=False):
         "band_names": spec["inputs"]["band_names"],
         "normalization": spec["inputs"]["normalization"],
         "pipeline": spec["pipeline"],
+        "custom_components": spec.get("custom_components", []),
         "training": spec["training"],
         "runs": [
             {
@@ -111,6 +112,9 @@ def make_pipeline_tools(*, version, campaign_id, seed, autonomy: AutonomyPolicy,
         if pipeline is not None and not autonomy.composes_pipelines:
             return {"status": "rejected", "error_code": "SCOPE_NOT_PERMITTED",
                     "message": "Composing pipeline components requires scope S1."}
+        out_of_scope = scope_rejection(autonomy, pipeline)
+        if out_of_scope:
+            return out_of_scope
         configuration = {
             "architecture": model_id, "learning_rate": learning_rate, "epochs": epochs,
             "batch_size": batch_size, "weight_decay": weight_decay, "pretrained": pretrained,
@@ -163,4 +167,67 @@ def make_pipeline_tools(*, version, campaign_id, seed, autonomy: AutonomyPolicy,
 
     if autonomy.composes_pipelines or autonomy.requires_proposal:
         tools += [propose_solution, inspect_solutions]
+    if autonomy.generates_code:
+        tools += make_custom_code_tools(campaign_id)
     return tools
+
+
+MAX_CUSTOM_SUBMISSIONS = 12
+
+
+def make_custom_code_tools(campaign_id):
+    """Scope S2 tools: write, validate (in the sandbox), and inspect custom losses.
+
+    Validation runs on synthetic CPU data inside the sandbox; it never touches a
+    dataset, the GPU, or the experiment budget, so it is capped separately.
+    """
+    from ml import custom_components
+
+    @tool
+    def describe_custom_loss_contract() -> dict:
+        """Describe the custom loss interface, allowed imports, validation checks, and
+        how generated code is isolated."""
+        return {"status": "success", **custom_components.contract_description()}
+
+    @tool
+    def submit_custom_loss(name: str, description: str, source: str, tasks: list[str],
+                           params: dict | None = None) -> dict:
+        """Submit Python source for a custom loss. It is archived, statically checked, and
+        executed only in the isolated sandbox against synthetic data. The reply lists
+        every failed check so you can revise and resubmit.
+
+        Args:
+            name: Short name for the loss.
+            description: The limitation it addresses and how it works.
+            source: Python module defining compute_loss (see describe_custom_loss_contract).
+            tasks: "classification" and/or "segmentation".
+            params: Optional JSON scalars passed to compute_loss as keyword arguments.
+        """
+        if len(custom_components.campaign_components(campaign_id)) >= MAX_CUSTOM_SUBMISSIONS:
+            return {"status": "rejected", "error_code": "SUBMISSION_LIMIT",
+                    "message": f"At most {MAX_CUSTOM_SUBMISSIONS} components per campaign."}
+        try:
+            return custom_components.submit_component(
+                source, tasks=tasks, params=params, name=name, description=description,
+                campaign_id=campaign_id, proposer="claude",
+            )
+        except custom_components.ComponentError as exc:
+            return exc.to_dict()
+
+    @tool
+    def inspect_custom_components(component_id: str | None = None) -> dict:
+        """List this campaign's custom components with their validation status, or pass
+        component_id for its full report and source."""
+        visible = custom_components.campaign_components(campaign_id)
+        try:
+            if component_id is not None:
+                if component_id not in visible:
+                    return {"status": "rejected", "error_code": "NOT_VISIBLE", "visible": visible}
+                return {"status": "success",
+                        "component": custom_components.describe(component_id, include_source=True)}
+            return {"status": "success",
+                    "components": [custom_components.describe(cid) for cid in visible]}
+        except custom_components.ComponentError as exc:
+            return exc.to_dict()
+
+    return [describe_custom_loss_contract, submit_custom_loss, inspect_custom_components]

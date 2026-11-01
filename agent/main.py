@@ -254,7 +254,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scope", choices=AVAILABLE_SCOPES, default="S0",
-        help="S0: existing knobs (default). S1: also compose pipeline components.",
+        help="S0: existing knobs (default). S1: also compose pipeline components. "
+             "S2: S1 plus sandboxed generated custom losses (Linux isolation required).",
     )
     parser.add_argument(
         "--policy", choices=SELECTION_POLICIES, default="P0",

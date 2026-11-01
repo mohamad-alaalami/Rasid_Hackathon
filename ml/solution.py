@@ -14,9 +14,11 @@ Results arrive separately as append-only events:
 
 Lineage (parent solution, change description) is an event, not part of the
 identity: one solution can be reached from several parents, which is the edge
-structure a future solution graph needs. ``initialization`` and
-``custom_components`` are reserved for warm starts and sandboxed code (scope
-S2); both must stay empty until those milestones exist.
+structure a future solution graph needs. ``custom_components`` lists generated
+code (scope S2) by component id and source SHA-256, so the identity binds the
+exact code; it is empty for every pipeline without generated code, so Phase 1A
+solution IDs are unchanged. ``initialization`` is reserved for warm starts and
+must stay empty.
 """
 
 from __future__ import annotations
@@ -123,8 +125,18 @@ def build_solution_spec(dataset_id: str, cfg) -> dict[str, Any]:
                         "early_stopping_patience", "early_stopping_min_delta")
         },
         "initialization": {"warm_start_from_solution": None, "warm_start_checkpoint": None},
-        "custom_components": [],
+        "custom_components": _custom_components(pipeline),
     }
+
+
+def _custom_components(pipeline) -> list[dict[str, Any]]:
+    if pipeline["loss"]["name"] != "custom":
+        return []
+    from .custom_components import CONTRACT, verify_component
+
+    component = verify_component(pipeline["loss"]["component_id"])
+    return [{"component_id": component["component_id"], "kind": "loss", "contract": CONTRACT,
+             "source_sha256": component["source_sha256"]}]
 
 
 def solution_id(spec: dict[str, Any]) -> str:
@@ -160,8 +172,20 @@ def _append_event(sid: str, event: dict[str, Any]) -> None:
 def propose_solution(spec: dict[str, Any], context: dict[str, Any] | None = None) -> str:
     """Store the spec (once, immutably) and record who proposed it and why."""
     context = dict(context or {})
-    if spec.get("custom_components"):
-        raise ValueError("custom_components are reserved for scope S2 and must be empty.")
+    for item in spec.get("custom_components") or []:
+        if not isinstance(item, dict) or set(item) != {"component_id", "kind", "contract",
+                                                       "source_sha256"}:
+            raise ValueError("custom_components entries (scope S2) must be {component_id, kind, "
+                             "contract, source_sha256} records of accepted generated components.")
+        from .custom_components import ComponentError, load_component
+
+        try:
+            component = load_component(item["component_id"])  # raises if tampered or unknown
+        except ComponentError as exc:
+            raise ValueError(f"custom component {item['component_id']!r}: {exc}") from exc
+        if component["source_sha256"] != item["source_sha256"] or not component["accepted"]:
+            raise ValueError(f"custom component {item['component_id']} is not an accepted, "
+                             "unmodified generated component.")
     if any(spec.get("initialization", {}).values()):
         raise ValueError("Warm starts are reserved for a later milestone; initialization must be empty.")
     parent = context.get("parent_solution_id")

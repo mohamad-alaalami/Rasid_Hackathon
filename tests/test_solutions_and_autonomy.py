@@ -249,8 +249,10 @@ class AgentAutonomyTests(TrainerTestCase):
     def test_reserved_levels_are_refused(self):
         with self.assertRaisesRegex(ValueError, "A0"):
             AutonomyPolicy(authority="A0")
-        with self.assertRaisesRegex(ValueError, "S2"):
-            AutonomyPolicy(scope="S2")
+        with self.assertRaisesRegex(ValueError, "S3"):
+            AutonomyPolicy(scope="S3")
+        self.assertTrue(AutonomyPolicy(scope="S2").generates_code)  # Phase 1B: explicit opt-in
+        self.assertFalse(AutonomyPolicy(scope="S1").generates_code)
 
     def test_s1_rejects_unsupported_combinations_before_budget(self):
         run = self.tool(AutonomyPolicy(scope="S1"))

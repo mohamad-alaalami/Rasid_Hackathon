@@ -249,6 +249,8 @@ def format_request(state, request):
         lines.append(f"      trade-offs: {option['tradeoffs']}")
         if option.get("configuration"):
             lines.append(f"      configuration: {json.dumps(option['configuration'])}")
+            for component_id in _generated_components(option["configuration"]):
+                lines += _component_lines(component_id)
             estimate = option.get("estimate") or {}
             usd = estimate.get("estimated_gpu_usd")
             seconds = estimate.get("estimated_training_seconds")
@@ -332,6 +334,34 @@ def _validate_consultation(trigger, situation, options, recommended_option, rati
     return errors
 
 
+def _generated_components(configuration):
+    """Generated (scope S2) components a run configuration references."""
+    pipeline = (configuration or {}).get("pipeline")
+    loss = pipeline.get("loss") if isinstance(pipeline, dict) else None
+    if isinstance(loss, dict) and loss.get("name") == "custom" and loss.get("component_id"):
+        return [loss["component_id"]]
+    return []
+
+
+def _component_lines(component_id):
+    """The exact archived source the human is approving (or why it is unavailable)."""
+    from ml.custom_components import ComponentError, load_component
+
+    try:
+        component = load_component(component_id)
+    except ComponentError as exc:
+        return [f"      generated component {component_id}: UNAVAILABLE ({exc.code}: {exc})"]
+    lines = [
+        f"      generated component {component_id} ({component.get('name') or 'unnamed'}): "
+        f"status {component['status']}, source sha256 {component['source_sha256'][:16]}..., "
+        f"tasks {component['tasks']}, params {json.dumps(component['params'])}",
+        "      ---- source (runs only inside the isolated sandbox) ----",
+    ]
+    lines += [f"      | {line}" for line in component["source"].splitlines()]
+    lines.append("      ---- end source ----")
+    return lines
+
+
 def _matches(approved, configuration):
     """An approved option binds only the run arguments it specified."""
     for key, value in approved.items():
@@ -355,6 +385,11 @@ class HitlController:
         if self.mode == "always":
             return ["before_experiment"], {"before_experiment": {"hitl_mode": "always"}}
         triggers, details = [], {}
+        generated = _generated_components(configuration)
+        if generated:
+            # Generated code (scope S2) is always a consequential change.
+            triggers.append("code_change")
+            details["code_change"] = {"generated_components": generated}
         records = load_campaign_experiments(
             self.settings["feedback"], self.campaign_id, self.settings["seed"]
         )
@@ -418,8 +453,18 @@ class HitlController:
             request for request in state["requests"]
             if request.get("approval") and request["approval"]["consumed_by_experiment"] is None
         ]
+        generated = _generated_components(configuration)
         for request in reversed(approvals):
             approved = request["approval"]["configuration"]
+            if generated:
+                # Generated code needs an approval that names this exact component, or a
+                # delegation given in a code_change consultation; nothing broader covers it.
+                if approved is None:
+                    if request.get("trigger") == "code_change":
+                        return request["id"], None
+                    continue
+                if _generated_components(approved) != generated:
+                    continue
             if approved is None or _matches(approved, configuration):
                 return request["id"], None
         if approvals:
@@ -612,7 +657,9 @@ consultation are rejected without using budget.""" + common
 HUMAN-IN-THE-LOOP MODE: critical.
 Act autonomously, but call request_human_consultation for consequential decisions:
 - "code_change": before proposing any change to code or the training pipeline.
-  You cannot change code yourself; the human decides.
+  Outside scope S2 you cannot change code yourself; the human decides. In scope
+  S2, every launch that uses a generated component is blocked until the human
+  approves that exact configuration (they are shown the component's source).
 - "repeated_failures" or "cost_threshold": when run_campaign_experiment returns
   HUMAN_APPROVAL_REQUIRED with that trigger (see its trigger_details).
 - "insufficient_evidence": optionally, when the evidence is too weak to choose

@@ -109,6 +109,8 @@ def train_model(
     _json_write(config_path, {"dataset_id": dataset_id, "solution_id": solution_id, **cfg.to_dict()})
     started = time.perf_counter()
     data = None
+    criterion = None
+    custom_components: list[dict[str, Any]] = []
 
     try:
         import torch
@@ -167,7 +169,14 @@ def train_model(
             weight_decay=cfg.weight_decay,
             epochs=cfg.epochs,
             device=device,
+            task_type=data.task_type,
         )
+        if data.pipeline["loss"]["name"] == "custom":
+            from .custom_components import archive_component
+
+            # The exact generated code travels with the checkpoint.
+            custom_components.append(archive_component(
+                data.pipeline["loss"]["component_id"], experiment_dir / "custom_components"))
         weights = class_weights(
             data.class_counts, data.pipeline["loss"].get("class_weighting", "none"), data.ignore_index
         )
@@ -235,6 +244,7 @@ def train_model(
                         "preprocessing": data.preprocessing,
                         "input_padding": getattr(model, "gotrain_input_padding", None),
                         "solution_id": solution_id,
+                        "custom_components": custom_components,
                         "pipeline": data.pipeline,
                         "class_counts": data.class_counts,
                         "class_weights": weights,
@@ -300,6 +310,7 @@ def train_model(
             "solution_id": solution_id,
             "pipeline": data.pipeline,
             "class_weights": weights,
+            "custom_components": custom_components,
         }
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -339,6 +350,7 @@ def train_model(
                 "metrics_path": str(metrics_path),
                 "config_path": str(config_path),
                 "optimizer_state_path": None,  # not saved in Phase 1A
+                "custom_components": custom_components,
             },
             "class_weights": weights,
             "dataset_fingerprint": data.dataset_fingerprint,
@@ -379,4 +391,8 @@ def train_model(
         except Exception:  # the training failure is the error worth reporting
             pass
         return result
+    finally:
+        from .components import close_criterion
+
+        close_criterion(criterion)  # stops a custom loss's sandbox worker
 

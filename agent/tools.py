@@ -7,7 +7,7 @@ import torch
 from strands import tool
 
 from agent.feedback import build_campaign_report, build_feedback
-from agent.autonomy import AutonomyPolicy
+from agent.autonomy import AutonomyPolicy, scope_rejection
 from agent.campaign import CampaignRunner
 from agent.policies import (
     DEFAULT_POLICY,
@@ -62,6 +62,7 @@ def agent_capabilities() -> dict:
             "Guarded training tool factory",
             "real autonomous multi-experiment campaigns",
             "composable pipeline components (scope S1)",
+            "sandboxed generated custom losses (scope S2, Linux isolation runtime required)",
             "versioned, immutable solution specifications",
         ],
         "datasets": list_dataset_specs(),
@@ -837,6 +838,9 @@ def make_registered_training_tool(
         if pipeline is not None:
             configuration["pipeline"] = pipeline
         identity["configuration"] = configuration
+        out_of_scope = scope_rejection(policy, pipeline)
+        if out_of_scope:
+            return reject(out_of_scope)
         mismatch = check_campaign_policy(campaign_id, seed, selection_policy)
         if mismatch:
             return reject(mismatch)

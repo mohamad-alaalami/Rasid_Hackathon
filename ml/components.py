@@ -49,7 +49,7 @@ ALTERNATIVE_VIEWS = {
 @dataclass(frozen=True)
 class Param:
     name: str
-    kind: str  # "float", "int", "bool", "choice"
+    kind: str  # "float", "int", "bool", "choice", "component"
     default: Any
     minimum: float | None = None
     maximum: float | None = None
@@ -108,6 +108,14 @@ CATALOG: dict[tuple[str, str], Component] = {
                    P("label_smoothing", "float", 0.0, 0.0, 0.3),
                    P("class_weighting", "choice", "none", choices=CLASS_WEIGHTING)),
                   tasks=("segmentation",)),
+        Component("loss", "custom",
+                  "A generated loss accepted by the isolated validator (scope S2). It runs only "
+                  "inside the sandbox; the trainer applies the gradient it returns.",
+                  (P("component_id", "component", None,
+                     description="id returned by submit_custom_loss"),
+                   P("class_weighting", "choice", "none", choices=CLASS_WEIGHTING)),
+                  constraints=("scope S2", "component accepted for this task",
+                               "Linux isolation runtime verified")),
         Component("optimizer", "adamw", "AdamW (historical default); uses learning_rate and weight_decay.",
                   (P("beta1", "float", 0.9, 0.5, 0.999), P("beta2", "float", 0.999, 0.9, 0.9999))),
         Component("optimizer", "sgd", "SGD with momentum; uses learning_rate and weight_decay.",
@@ -148,6 +156,10 @@ def _resolve_params(component, raw, where, errors):
         value = raw.get(param.name, param.default)
         if param.kind == "bool":
             ok = isinstance(value, bool)
+        elif param.kind == "component":
+            from .custom_components import COMPONENT_ID
+
+            ok = isinstance(value, str) and bool(COMPONENT_ID.match(value))
         elif param.kind == "choice":
             ok = value in param.choices
         elif param.kind == "int":
@@ -206,8 +218,9 @@ def resolve_pipeline(raw=None):
             or not 0.0 <= dropout <= 0.5):
         errors.append(f"dropout={dropout!r} must be a number in [0, 0.5]")
     if raw.get("custom_components"):
-        errors.append("custom_components are reserved for scope S2 (sandboxed code), "
-                      "which is not available yet")
+        errors.append("custom_components cannot be set directly (reserved for scope S2): "
+                      "reference a validated generated loss with "
+                      "loss={'name': 'custom', 'component_id': ...}")
     resolved = {
         "input_view": view,
         "normalization": normalization,
@@ -256,6 +269,10 @@ def compatibility_errors(pipeline, dataset_spec, model_spec, effective_resolutio
     scheduler = pipeline["scheduler"]
     if scheduler["name"] == "warmup_cosine" and epochs <= scheduler["warmup_epochs"]:
         errors.append(f"warmup_cosine needs epochs > warmup_epochs ({scheduler['warmup_epochs']})")
+    if pipeline["loss"]["name"] == "custom":
+        from .custom_components import component_errors
+
+        errors.extend(component_errors(pipeline["loss"]["component_id"], task))
     if pipeline["dropout"] > 0 and task != "classification":
         errors.append("dropout is supported only on classification heads")
     return errors
@@ -282,7 +299,9 @@ def describe_configuration_space(dataset_spec=None, model_specs=()):
                                "image_size", "early_stopping", "early_stopping_patience",
                                "early_stopping_min_delta", "pretrained"],
         "not_offered": ["per-channel colour jitter", "hue/saturation", "channel shuffling",
-                        "custom code (scope S2, reserved)"],
+                        "generated code other than custom losses"],
+        "custom_loss": ("scope S2 only: loss={'name': 'custom', 'component_id': ...} with a "
+                        "component accepted by submit_custom_loss"),
     }
     if dataset_spec is not None:
         task = dataset_spec.task_type
@@ -446,11 +465,19 @@ def _loss_classes():
     return FocalLoss, DiceCrossEntropyLoss
 
 
-def build_loss(pipeline, num_classes, ignore_index=None, class_counts=None, device=None):
+def build_loss(pipeline, num_classes, ignore_index=None, class_counts=None, device=None,
+               task_type=None):
     import torch
 
     spec = pipeline["loss"]
     weight = class_weights(class_counts, spec.get("class_weighting", "none"), ignore_index)
+    if spec["name"] == "custom":
+        # Generated code: executed only in the isolated sandbox, never imported here.
+        from .custom_components import sandboxed_loss
+
+        if task_type is None:
+            raise ValueError("custom losses need the task type")
+        return sandboxed_loss(spec["component_id"], task_type, weight, ignore_index)
     if weight is not None and device is not None:
         weight = weight.to(device)
     if spec["name"] == "cross_entropy":
@@ -502,8 +529,18 @@ def build_scheduler(pipeline, optimizer, epochs):
 
 
 def build_training_components(pipeline, model, *, num_classes, ignore_index, class_counts,
-                              learning_rate, weight_decay, epochs, device=None):
-    """Criterion, optimizer, and scheduler for one training run."""
-    criterion = build_loss(pipeline, num_classes, ignore_index, class_counts, device)
+                              learning_rate, weight_decay, epochs, device=None, task_type=None):
+    """Criterion, optimizer, and scheduler for one training run.
+
+    A custom criterion owns a sandbox worker; call ``close_criterion`` when done.
+    """
+    criterion = build_loss(pipeline, num_classes, ignore_index, class_counts, device, task_type)
     optimizer = build_optimizer(pipeline, model.parameters(), learning_rate, weight_decay)
     return criterion, optimizer, build_scheduler(pipeline, optimizer, epochs)
+
+
+def close_criterion(criterion) -> None:
+    """Shut down a sandbox-backed criterion; a no-op for built-in losses."""
+    close = getattr(criterion, "close", None)
+    if callable(close):
+        close()

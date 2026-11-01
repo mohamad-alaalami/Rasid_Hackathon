@@ -12,7 +12,10 @@ Scope:
 - S0: existing configuration knobs (model, epochs, batch size, learning rate,
   weight decay, pretrained, image size, early stopping). Historical default.
 - S1: S0 plus composing supported pipeline components (ml/components.py).
-- S2: isolated experimental code changes. Reserved; not available yet.
+- S2: S1 plus generated code: Claude writes custom loss functions that are
+  validated and executed only in the isolated Linux sandbox (ml/sandbox.py).
+  Must be enabled explicitly; S0 and S1 reject generated components before
+  any validation or budget use.
 
 Both axes are independent of the P0/P1 selection policy and the HITL mode,
 which keep their existing behavior. Every hard boundary (model eligibility,
@@ -32,10 +35,10 @@ AUTHORITY_LEVELS = {
 SCOPE_LEVELS = {
     "S0": "existing configuration knobs",
     "S1": "composing supported pipeline components",
-    "S2": "isolated experimental code changes (reserved)",
+    "S2": "generated custom losses, executed only in the isolated sandbox",
 }
 CLAUDE_AUTHORITIES = ("A1", "A2")
-AVAILABLE_SCOPES = ("S0", "S1")
+AVAILABLE_SCOPES = ("S0", "S1", "S2")
 
 
 @dataclass(frozen=True)
@@ -51,11 +54,15 @@ class AutonomyPolicy:
         if self.scope not in SCOPE_LEVELS:
             raise ValueError(f"Unknown scope {self.scope!r}.")
         if self.scope not in AVAILABLE_SCOPES:
-            raise ValueError("Scope S2 (sandboxed code changes) is reserved for a later milestone.")
+            raise ValueError(f"Scope {self.scope!r} is not available.")
 
     @property
     def composes_pipelines(self) -> bool:
-        return self.scope == "S1"
+        return self.scope in ("S1", "S2")
+
+    @property
+    def generates_code(self) -> bool:
+        return self.scope == "S2"
 
     @property
     def requires_proposal(self) -> bool:
@@ -101,9 +108,36 @@ class AutonomyPolicy:
                 "solution relates to an earlier one, and inspect_solutions to review solutions, "
                 "checkpoints, and validation evidence."
             )
+        if self.generates_code:
+            lines.append(
+                "Scope S2: when no supported loss fits your diagnosis, you may write a custom "
+                "loss. Call describe_custom_loss_contract, then submit_custom_loss with the "
+                "Python source; it is validated on synthetic data in an isolated sandbox and "
+                "the structured results tell you what to fix. Only accepted components can be "
+                "used, via pipeline loss={'name': 'custom', 'component_id': ...}. Record in "
+                "change_description what limitation the loss addresses, and compare its "
+                "validation results against your earlier solutions. A custom loss changes only "
+                "the training signal; metrics, splits, and checkpoint selection are unchanged."
+            )
         if self.requires_proposal:
             lines.append(
                 "Before each launch, call propose_solution with the exact configuration; "
                 "run_campaign_experiment only accepts proposed solutions."
             )
         return "\n".join(lines) + "\n"
+
+
+def uses_generated_code(pipeline) -> bool:
+    """True when a pipeline references a generated (scope S2) component."""
+    if not isinstance(pipeline, dict):
+        return False
+    loss = pipeline.get("loss")
+    name = loss if isinstance(loss, str) else loss.get("name") if isinstance(loss, dict) else None
+    return name == "custom" or bool(pipeline.get("custom_components"))
+
+
+def scope_rejection(policy: AutonomyPolicy, pipeline) -> dict | None:
+    if uses_generated_code(pipeline) and not policy.generates_code:
+        return {"status": "rejected", "error_code": "SCOPE_NOT_PERMITTED",
+                "message": "Generated components require scope S2. No budget was used."}
+    return None
